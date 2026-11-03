@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+config BBK9288S
+    bool
+    default y
+    depends on S1C33
+
+config XP3200
+    bool
+    default y
+    depends on S1C33

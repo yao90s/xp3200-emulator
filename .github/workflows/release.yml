@@ -1,0 +1,150 @@
+name: Build Windows package
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-package-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  windows-x64:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: powershell
+
+    steps:
+      - name: Preserve Unix line endings
+        run: git config --global core.autocrlf input
+
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build Web frontend
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13.11"
+          cache: pip
+          cache-dependency-path: requirements-bbk9288.txt
+
+      - name: Set up MSYS2
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            base-devel
+            git
+            diffutils
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-glib2
+            mingw-w64-ucrt-x86_64-pixman
+            mingw-w64-ucrt-x86_64-zlib
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-python
+
+      - name: Configure QEMU
+        shell: msys2 {0}
+        run: |
+          mkdir -p _build
+          cd _build
+          ../configure \
+            --target-list=s1c33-softmmu \
+            --without-default-features \
+            --enable-tcg \
+            --enable-vnc \
+            --enable-pixman \
+            --disable-werror \
+            --disable-docs \
+            --disable-tools
+
+      - name: Build QEMU
+        shell: msys2 {0}
+        working-directory: _build
+        run: ninja qemu-system-s1c33.exe
+
+      - name: Prepare portable Python
+        run: |
+          ./scripts/prepare-bbk9288-python.ps1 `
+            -OutputDir "_build/portable-python" `
+            -Requirements "requirements-bbk9288.txt"
+
+      - name: Package Windows Web build
+        run: |
+          $version = if ("${{ github.ref_type }}" -eq "tag") {
+            "${{ github.ref_name }}"
+          } else {
+            "ci-${{ github.run_number }}"
+          }
+          $name = "bbk9288-emulator-$version-windows-x64"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          ./scripts/package-bbk9288.ps1 `
+            -QemuPath "_build/qemu-system-s1c33.exe" `
+            -WebDist "web/dist" `
+            -PythonRuntime "_build/portable-python" `
+            -OutputDir "dist/$name" `
+            -ArchivePath "dist/$name.zip" `
+            -MsysBin "${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin"
+          ./scripts/smoke-test-bbk9288-package.ps1 `
+            -PackageDir "dist/$name"
+          Get-FileHash "dist/$name.zip" -Algorithm SHA256 |
+            ForEach-Object {
+              "$($_.Hash.ToLowerInvariant())  $name.zip"
+            } | Set-Content "dist/$name.zip.sha256" -Encoding ascii
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v7
+        with:
+          name: bbk9288-emulator-windows-x64
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: windows-x64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download Windows package
+        uses: actions/download-artifact@v8
+        with:
+          name: bbk9288-emulator-windows-x64
+          path: dist
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.zip
+            dist/*.sha256
