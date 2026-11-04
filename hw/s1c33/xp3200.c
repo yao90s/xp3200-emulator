@@ -19,6 +19,7 @@
 #include "system/address-spaces.h"
 #include "system/memory.h"
 #include "system/rtc.h"
+#include "system/runstate.h"
 #include "system/system.h"
 #include "qemu/timer.h"
 #include "ui/console.h"
@@ -640,6 +641,10 @@ typedef struct XP3200SState {
     bool sd_multi;
     bool sd_inserted;
     QEMUTimer *sd_insert_timer;
+    /* Watchdog: the OS writes 0x23 to 16TM0 control (0x8186) every ~10 ms.
+     * If that stops for 2 s the real device resets. */
+    QEMUTimer *wdt_timer;
+    bool wdt_armed;
     uint8_t board_data_latch_reads;
     bool board_data_latch_pending;
     bool usb_connected;
@@ -4368,6 +4373,18 @@ static bool xp3200s_timer16_read_byte(XP3200SState *s, hwaddr offset,
     return true;
 }
 
+static void xp3200s_wdt_expire(void *opaque)
+{
+    XP3200SState *s = opaque;
+
+    if (!s->wdt_armed) {
+        return;
+    }
+    s->wdt_armed = false;
+    error_report("xp3200: watchdog timeout - resetting");
+    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+}
+
 static bool xp3200s_timer16_write_byte(XP3200SState *s, hwaddr offset,
                                         uint8_t value)
 {
@@ -4396,6 +4413,12 @@ static bool xp3200s_timer16_write_byte(XP3200SState *s, hwaddr offset,
         return true;
     }
     if (rel == 6) {
+        if (offset == XP3200S_16TM_CTRL(0) && value == 0x23) {
+            /* OS watchdog feed: restart the 2 s timer. */
+            s->wdt_armed = true;
+            timer_mod(s->wdt_timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 2000);
+        }
         mask = reg != NULL ? reg->mask : 0x7f;
         if ((value & XP3200S_16TM_CTRL_PRESET) != 0) {
             xp3200s_timer16_stw(s, XP3200S_16TM_COUNTER(channel), 0);
@@ -8324,6 +8347,7 @@ static void xp3200s_init(MachineState *machine)
                  bms->debug_lcd_dump_path : "xp3200s-lcd.pgm");
     xp3200s_nand_storage_init(s, bms->nand_image_path);
     xp3200s_sd_init(s, bms->sd_image_path);
+    s->wdt_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, xp3200s_wdt_expire, s);
     s->sd_inserted = true;
     if (bms->debug_sd_insert_ms != 0) {
         s->sd_inserted = false;
