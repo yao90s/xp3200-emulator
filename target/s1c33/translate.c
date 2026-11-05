@@ -30,6 +30,8 @@ enum {
     S1C33_TRACE_REG_CALL,
     S1C33_TRACE_RET,
     S1C33_TRACE_RETI,
+    S1C33_TRACE_JP,
+    S1C33_TRACE_REG_JP,
 };
 
 static void translate_one(DisasContext *ctx, uint16_t word);
@@ -618,6 +620,12 @@ static void gen_relative_call_or_jump(DisasContext *ctx, uint16_t word,
                                       tcg_constant_i32(ctx->pc),
                                       tcg_constant_i32(dest),
                                       tcg_constant_i32(return_pc));
+    } else {
+        gen_helper_s1c33_trace_branch(tcg_env,
+                                      tcg_constant_i32(S1C33_TRACE_JP),
+                                      tcg_constant_i32(ctx->pc),
+                                      tcg_constant_i32(dest),
+                                      tcg_constant_i32(0));
     }
 
     if (delayed) {
@@ -656,6 +664,11 @@ static void gen_register_call_or_jump(DisasContext *ctx, uint16_t word,
                                       tcg_constant_i32(S1C33_TRACE_REG_CALL),
                                       tcg_constant_i32(ctx->pc), target,
                                       tcg_constant_i32(return_pc));
+    } else {
+        gen_helper_s1c33_trace_branch(tcg_env,
+                                      tcg_constant_i32(S1C33_TRACE_REG_JP),
+                                      tcg_constant_i32(ctx->pc), target,
+                                      tcg_constant_i32(0));
     }
 
     if (delayed) {

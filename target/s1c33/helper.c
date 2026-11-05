@@ -11,10 +11,66 @@
 #include "exec/helper-proto.h"
 #include "exec/log.h"
 #include "system/runstate.h"
+#include "hw/core/cpu.h"
 
 #define S1C33_DEBUG_LOW_RAM_LIMIT   0x00040000u
 #define S1C33_DEBUG_SDRAM_BASE      0x02000000u
 #define S1C33_DEBUG_SDRAM_LIMIT     0x04000000u
+
+static void s1c33_trap_dump(CPUS1C33State *env, uint32_t pc)
+{
+    CPUState *cs = env_cpu(env);
+    uint8_t buf[16];
+    uint8_t buf0[16];
+    uint32_t base = env->regs[6];
+    uint32_t base0 = env->regs[0];
+    unsigned code0 = 0, param0 = 0;
+
+    memset(buf, 0, sizeof(buf));
+    memset(buf0, 0, sizeof(buf0));
+    if (base >= S1C33_DEBUG_SDRAM_BASE && base < S1C33_DEBUG_SDRAM_LIMIT) {
+        cpu_memory_rw_debug(cs, base, buf, sizeof(buf), false);
+    }
+    if (base0 >= S1C33_DEBUG_SDRAM_BASE && base0 < S1C33_DEBUG_SDRAM_LIMIT) {
+        cpu_memory_rw_debug(cs, base0, buf0, sizeof(buf0), false);
+        code0 = buf0[4] | (buf0[5] << 8);
+        param0 = buf0[8] | (buf0[9] << 8) | (buf0[10] << 16) |
+                 (buf0[11] << 24);
+    }
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "s1c33-trap: pc=0x%08x sp=0x%08x psr=0x%08x "
+                  "r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x "
+                  "r4=0x%08x r5=0x%08x r6=0x%08x r7=0x%08x "
+                  "r8=0x%08x r9=0x%08x code=0x%04x param=0x%08x "
+                  "code0=0x%04x param0=0x%08x "
+                  "b=%02x%02x%02x%02x.%02x%02x%02x%02x.%02x%02x%02x%02x.%02x%02x%02x%02x\n",
+                  pc, env->sp, env->psr,
+                  env->regs[0], env->regs[1], env->regs[2], env->regs[3],
+                  env->regs[4], env->regs[5], env->regs[6], env->regs[7],
+                  env->regs[8], env->regs[9],
+                  (unsigned)(buf[4] | (buf[5] << 8)),
+                  (unsigned)(buf[8] | (buf[9] << 8) | (buf[10] << 16) |
+                             (buf[11] << 24)),
+                  code0, param0,
+                  buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+                  buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14],
+                  buf[15]);
+    {
+        char tbs[192];
+        int k, o = 0;
+        tbs[0] = 0;
+        for (k = 1; k <= 8; k++) {
+            uint32_t idx = (env->recent_tb_pos + S1C33_RECENT_TB_LEN - k) %
+                           S1C33_RECENT_TB_LEN;
+            o += snprintf(tbs + o, sizeof(tbs) - o, " %08x",
+                          env->recent_tbs[idx]);
+            if (o >= (int)sizeof(tbs) - 12) {
+                break;
+            }
+        }
+        qemu_log_mask(LOG_GUEST_ERROR, "s1c33-trap: tbs=%s\n", tbs);
+    }
+}
 
 void helper_s1c33_record_tb(CPUS1C33State *env, uint32_t pc)
 {
@@ -25,6 +81,11 @@ void helper_s1c33_record_tb(CPUS1C33State *env, uint32_t pc)
     env->recent_tb_pos = (env->recent_tb_pos + 1) % S1C33_RECENT_TB_LEN;
     if (env->recent_tb_count < S1C33_RECENT_TB_LEN) {
         env->recent_tb_count++;
+    }
+
+    if ((cpu->trace_trap_addr != 0 && pc == cpu->trace_trap_addr) ||
+        (cpu->trace_trap_addr2 != 0 && pc == cpu->trace_trap_addr2)) {
+        s1c33_trap_dump(env, pc);
     }
 
     if (cpu->trace_exec) {
@@ -82,6 +143,8 @@ enum {
     S1C33_TRACE_REG_CALL,
     S1C33_TRACE_RET,
     S1C33_TRACE_RETI,
+    S1C33_TRACE_JP,
+    S1C33_TRACE_REG_JP,
 };
 
 static bool s1c33_trace_call_addr_match(S1C33CPU *cpu, uint32_t addr)
@@ -124,6 +187,12 @@ void helper_s1c33_trace_branch(CPUS1C33State *env, uint32_t kind,
     case S1C33_TRACE_RETI:
         name = "reti";
         break;
+    case S1C33_TRACE_JP:
+        name = "jp";
+        break;
+    case S1C33_TRACE_REG_JP:
+        name = "jp-reg";
+        break;
     default:
         name = "branch";
         break;
@@ -132,9 +201,13 @@ void helper_s1c33_trace_branch(CPUS1C33State *env, uint32_t kind,
     qemu_log_mask(LOG_GUEST_ERROR,
                   "s1c33-call: %-8s from=0x%08x to=0x%08x "
                   "aux=0x%08x sp=0x%08x psr=0x%08x "
-                  "r6=0x%08x r7=0x%08x r8=0x%08x r9=0x%08x\n",
+                  "r6=0x%08x r7=0x%08x r8=0x%08x r9=0x%08x "
+                  "r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x "
+                  "r4=0x%08x r5=0x%08x\n",
                   name, from, to, aux, env->sp, env->psr,
-                  env->regs[6], env->regs[7], env->regs[8], env->regs[9]);
+                  env->regs[6], env->regs[7], env->regs[8], env->regs[9],
+                  env->regs[0], env->regs[1], env->regs[2], env->regs[3],
+                  env->regs[4], env->regs[5]);
 }
 
 void helper_s1c33_trace_mem(CPUS1C33State *env, uint32_t is_write,

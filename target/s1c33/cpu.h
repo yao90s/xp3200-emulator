@@ -76,6 +76,8 @@ struct ArchCPU {
     uint32_t trace_mem_end;
     uint32_t trace_mem_pc_start;
     uint32_t trace_mem_pc_end;
+    uint32_t trace_trap_addr;
+    uint32_t trace_trap_addr2;
 };
 
 struct S1C33CPUClass {
