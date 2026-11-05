@@ -539,6 +539,7 @@ struct XP3200SMachineState {
     uint32_t debug_key_matrix;
     bool strict_board_io;
     bool is_9288;
+    void *soc;              /* XP3200SState, set in xp3200s_init */
 };
 
 typedef enum XP3200SRegFlags {
@@ -7190,6 +7191,10 @@ static void xp3200s_nand_command(XP3200SState *s, uint8_t command)
                              ((uint16_t)s->nand_address[1] << 8);
             s->nand_phase = XP3200S_NAND_READ_DATA;
             s->nand_data_reads = 0;
+            if (s->trace_io) {
+                fprintf(stderr, "NANDCOL cmd=e0 pc=%08x page=%u col=%u\n",
+                        xp3200s_current_pc(), s->nand_page, s->nand_column);
+            }
         }
         break;
     case 0x00:
@@ -7226,6 +7231,10 @@ static void xp3200s_nand_command(XP3200SState *s, uint8_t command)
                              0x0fff;
             s->nand_phase = XP3200S_NAND_READ_DATA;
             s->nand_data_reads = 0;
+            if (s->trace_io) {
+                fprintf(stderr, "NANDCOL cmd=30 pc=%08x page=%u col=%u\n",
+                        xp3200s_current_pc(), s->nand_page, s->nand_column);
+            }
         }
         break;
     case 0x35:
@@ -7348,6 +7357,10 @@ static uint8_t xp3200s_nand_data_read_byte(XP3200SState *s)
             value = s->nand_storage[offset];
         }
         xp3200s_nand_ecc_byte(s, value);
+        if (s->trace_io) {
+            fprintf(stderr, "NANDD pc=%08x page=%u col=%u val=%02x\n",
+                    xp3200s_current_pc(), s->nand_page, s->nand_column, value);
+        }
         s->nand_data_reads++;
         s->nand_column++;
         return value;
@@ -8317,6 +8330,7 @@ static void xp3200s_init(MachineState *machine)
     s->trace_io = bms->trace_io;
     s->trace_key_scan = bms->trace_key_scan;
     s->trace_audio = bms->trace_audio;
+    bms->soc = s;
     s->debug_key_code = bms->debug_key_code;
     s->debug_key_matrix = bms->debug_key_matrix;
     s->strict_board_io = bms->strict_board_io;
@@ -8534,7 +8548,12 @@ static bool xp3200s_get_trace_io(Object *obj, Error **errp)
 
 static void xp3200s_set_trace_io(Object *obj, bool value, Error **errp)
 {
-    XP3200S_MACHINE(obj)->trace_io = value;
+    XP3200SMachineState *bms = XP3200S_MACHINE(obj);
+
+    bms->trace_io = value;
+    if (bms->soc) {
+        ((XP3200SState *)bms->soc)->trace_io = value;
+    }
 }
 
 static bool xp3200s_get_trace_key_scan(Object *obj, Error **errp)
@@ -8549,12 +8568,22 @@ static bool xp3200s_get_trace_audio(Object *obj, Error **errp)
 
 static void xp3200s_set_trace_audio(Object *obj, bool value, Error **errp)
 {
-    XP3200S_MACHINE(obj)->trace_audio = value;
+    XP3200SMachineState *bms = XP3200S_MACHINE(obj);
+
+    bms->trace_audio = value;
+    if (bms->soc) {
+        ((XP3200SState *)bms->soc)->trace_audio = value;
+    }
 }
 
 static void xp3200s_set_trace_key_scan(Object *obj, bool value, Error **errp)
 {
-    XP3200S_MACHINE(obj)->trace_key_scan = value;
+    XP3200SMachineState *bms = XP3200S_MACHINE(obj);
+
+    bms->trace_key_scan = value;
+    if (bms->soc) {
+        ((XP3200SState *)bms->soc)->trace_key_scan = value;
+    }
 }
 
 static char *xp3200s_get_debug_lcd_dump_path(Object *obj, Error **errp)
