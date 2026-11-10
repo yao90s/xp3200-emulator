@@ -9054,7 +9054,7 @@ static void xp3200_machine_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
 
-    mc->desc = "XP3200 (Epson S1C33L05, 320x240, 8MiB SDRAM)";
+    mc->desc = "XP3200 (快易典, Epson S1C33L05, 320x240, 8MiB SDRAM)";
     mc->default_ram_id = "xp3200.sdram";
 }
 

@@ -1,6 +1,6 @@
-# 好易通 XP3200 QEMU 模拟器
+﻿# 快易典 XP3200 QEMU 模拟器
 
-这是基于 QEMU 11 实现的好易通 XP3200 硬件模拟器，模拟 Epson S1C33L05
+这是基于 QEMU 11 实现的快易典 XP3200 硬件模拟器，模拟 Epson S1C33L05
 处理器、`320 × 240` 屏幕、5 行 × 14 列键盘、NAND/NOR、SD 卡、VS1003
 音频及相关板级硬件。
 
@@ -183,7 +183,7 @@ bash scripts/xp3200/sd_image.sh create ~/card.img 128 "SD CARD" ~/音乐 ~/电�
 - 音频由 `ffplay` 负责 MPEG 解码，不模拟 VS1003 内部音质、模拟输出和
   全部 SCI 扩展行为。
 - USB、部分板级扩展寄存器仍为实验性模型。
-- 此项目是非官方逆向工程，与好易通、Epson 或 QEMU 项目没有隶属关系。
+- 此项目是非官方逆向工程，与快易典、Epson 或 QEMU 项目没有隶属关系。
 
 ## 许可证
 
