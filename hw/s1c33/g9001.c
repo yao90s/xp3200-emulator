@@ -428,7 +428,8 @@ typedef struct G9001State {
     MemoryRegion card4;
     MemoryRegion card14;
     MemoryRegion card11;
-    MemoryRegion sdram_alias;
+    MemoryRegion area7;
+    uint8_t *area7_ptr;
     uint8_t *a0ram_ptr;
     uint8_t *ivram_ptr;
     uint8_t *sdram_ptr;
@@ -1931,8 +1932,8 @@ static void g9001_t16_cb(void *opaque)
      * of the boot does.
      */
     if (gms->debug_force_event && s->sdram_ptr != NULL) {
-        s->sdram_ptr[G9001_FLAG_EVENT - G9001_AREA7_BASE] = 1;
-        s->sdram_ptr[G9001_FLAG_PHASE - G9001_AREA7_BASE] = 2;
+        s->area7_ptr[G9001_FLAG_EVENT - G9001_AREA7_BASE] = 1;
+        s->area7_ptr[G9001_FLAG_PHASE - G9001_AREA7_BASE] = 2;
     }
     timer_mod(s->t16_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
 }
@@ -2567,11 +2568,16 @@ static void g9001_init(MachineState *machine)
      * second stage to 0x400000 and jumps there.  Alias the first 2 MiB of the
      * SDRAM over Area 7 so both views reach the same memory.
      */
-    memory_region_init_alias(&s->sdram_alias, NULL, "g9001.sdram-area7",
-                             machine->ram, 0,
-                             MIN((uint64_t)G9001_AREA7_SIZE,
-                                 (uint64_t)machine->ram_size));
-    memory_region_add_subregion(sysmem, G9001_AREA7_BASE, &s->sdram_alias);
+    /*
+     * Area 7 (0x400000-0x5fffff) holds the boot loader and the kernel.  It
+     * must NOT alias the low SDRAM: the firmware OS clears its framebuffer at
+     * 0x10000000 by filling it with 0xff, which would wipe the kernel and its
+     * trap table if both windows reached the same memory.
+     */
+    memory_region_init_ram(&s->area7, NULL, "g9001.area7",
+                           G9001_AREA7_SIZE, &error_fatal);
+    memory_region_add_subregion(sysmem, G9001_AREA7_BASE, &s->area7);
+    s->area7_ptr = memory_region_get_ram_ptr(&s->area7);
 
     g9001_active = s;
     g9001_nand_reset(s);
