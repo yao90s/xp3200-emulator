@@ -247,6 +247,7 @@ typedef struct G9001Nand {
     bool spare_real;                /* direct spare reads bypass ignore_ecc */
     bool program_loaded;
     bool spare_stream;              /* col >= data_size stays in the stream */
+    bool spare_per_sector;          /* spare holds 16 bytes per 512B sector */
     GHashTable *written;            /* page -> programmed bytes (RAM overlay) */
 
     /*
@@ -303,6 +304,7 @@ typedef struct G9001MachineState {
     bool nand_ignore_ecc;
     bool nand_spare_real;
     bool nand_spare_stream;
+    bool nand_spare_per_sector;
     bool slp_as_nop;                /* treat SLP as NOP (default on) */
 } G9001MachineState;
 
@@ -788,6 +790,7 @@ static void g9001_nand_latch_addr(G9001State *s)
 #define G9001_NAND_STREAM_SIZE \
     (G9001_NAND_SECTOR_STRIDE * G9001_NAND_SECTORS)
 #define G9001_NAND_ECC_AREA     G9001_NAND_PAGE_DATA
+#define G9001_NAND_SPARE_PER_SECTOR 16
 
 static unsigned g9001_nand_sectors(const G9001Nand *n)
 {
@@ -822,6 +825,16 @@ static unsigned g9001_nand_stream_offset(const G9001Nand *n, unsigned pos)
     }
     if (off < G9001_NAND_SECTOR_DATA) {
         return sector * G9001_NAND_SECTOR_DATA + off;
+    }
+    /*
+     * The dump's spare area repeats a 16-byte group per 512-byte sector:
+     * eight bytes of block bookkeeping followed by eight ECC bytes.  The
+     * sector-interleaved layout puts the ECC at 16*sector+8; the older planar
+     * layout assumed the ECCs were packed at the start of the spare.
+     */
+    if (n->spare_per_sector) {
+        return n->data_size + sector * G9001_NAND_SPARE_PER_SECTOR +
+               G9001_NAND_SECTOR_ECC + (off - G9001_NAND_SECTOR_DATA);
     }
     return n->data_size + sector * G9001_NAND_SECTOR_ECC +
            (off - G9001_NAND_SECTOR_DATA);
@@ -2672,6 +2685,7 @@ static void g9001_init(MachineState *machine)
     s->nand.ignore_ecc = gms->nand_ignore_ecc;
     s->nand.spare_real = gms->nand_spare_real;
     s->nand.spare_stream = gms->nand_spare_stream;
+    s->nand.spare_per_sector = gms->nand_spare_per_sector;
     if (gms->nand_bad_blocks != NULL) {
         const char *p = gms->nand_bad_blocks;
 
@@ -2979,6 +2993,17 @@ static void g9001_set_nand_spare_stream(Object *obj, bool value, Error **errp)
     G9001_MACHINE(obj)->nand_spare_stream = value;
 }
 
+static bool g9001_get_nand_spare_per_sector(Object *obj, Error **errp)
+{
+    return G9001_MACHINE(obj)->nand_spare_per_sector;
+}
+
+static void g9001_set_nand_spare_per_sector(Object *obj, bool value,
+                                            Error **errp)
+{
+    G9001_MACHINE(obj)->nand_spare_per_sector = value;
+}
+
 static char *g9001_get_nand_bad_blocks(Object *obj, Error **errp)
 {
     return g_strdup(G9001_MACHINE(obj)->nand_bad_blocks);
@@ -3227,6 +3252,13 @@ static void g9001_machine_instance_init(Object *obj)
                                     "Treat every column, including >= page data "
                                     "size, as a position in the interleaved "
                                     "512+8 stream instead of the raw spare area");
+    object_property_add_bool(obj, "nand-spare-per-sector",
+                             g9001_get_nand_spare_per_sector,
+                             g9001_set_nand_spare_per_sector);
+    object_property_set_description(obj, "nand-spare-per-sector",
+                                    "Spare area is 16 bytes per 512-byte sector "
+                                    "(8 bytes of block bookkeeping then 8 ECC "
+                                    "bytes) instead of a packed ECC area");
     object_property_add_str(obj, "nand-bad-blocks",
                             g9001_get_nand_bad_blocks,
                             g9001_set_nand_bad_blocks);
