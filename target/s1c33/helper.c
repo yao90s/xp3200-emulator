@@ -203,11 +203,14 @@ void helper_s1c33_trace_branch(CPUS1C33State *env, uint32_t kind,
                   "aux=0x%08x sp=0x%08x psr=0x%08x "
                   "r6=0x%08x r7=0x%08x r8=0x%08x r9=0x%08x "
                   "r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x "
-                  "r4=0x%08x r5=0x%08x\n",
+                  "r4=0x%08x r5=0x%08x "
+                  "r12=0x%08x r13=0x%08x r14=0x%08x r15=0x%08x\n",
                   name, from, to, aux, env->sp, env->psr,
                   env->regs[6], env->regs[7], env->regs[8], env->regs[9],
                   env->regs[0], env->regs[1], env->regs[2], env->regs[3],
-                  env->regs[4], env->regs[5]);
+                  env->regs[4], env->regs[5],
+                  env->regs[12], env->regs[13], env->regs[14],
+                  env->regs[15]);
 }
 
 void helper_s1c33_trace_mem(CPUS1C33State *env, uint32_t is_write,
