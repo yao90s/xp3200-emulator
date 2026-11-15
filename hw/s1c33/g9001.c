@@ -127,10 +127,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(G9001MachineState, G9001_MACHINE)
 #define G9001_IO_CMU_CLKCNTL    0x001b08
 #define G9001_IO_CMU_OPT        0x001b14
 #define G9001_IO_CMU_PROTECT    0x001b24
-#define G9001_IO_T16_0A         0x001810
-#define G9001_IO_T16_0B         0x001812
-#define G9001_IO_T16_0C         0x001814
-#define G9001_IO_T16_0D         0x001816
+#define G9001_IO_T16_0CA        0x000780   /* pT16_CA0 */
+#define G9001_IO_T16_0CB        0x000782   /* pT16_CB0 */
+#define G9001_IO_T16_0TC        0x000784   /* pT16_TC0 */
+#define G9001_IO_T16_0CTL       0x000786   /* pT16_CTL0 */
 #define G9001_IO_WDT            0x001830
 
 /* GPIO: PnD = 0x300380 + 2n, PnDIR = PnD + 1, Pxy function = 0x3003A0 + ... */
@@ -237,11 +237,23 @@ typedef struct G9001MachineState {
     uint32_t debug_pc_sample_ms;
     bool trace_io;
     bool trace_nand;
+    bool trace_irq;
+    uint32_t t16_hz;
     uint32_t nand_cle_pin;          /* port * 8 + bit, 0xffffffff = not wired */
     uint32_t nand_ale_pin;
     uint32_t nand_ryby_pin;
     uint32_t nand_ecc_offset;
 } G9001MachineState;
+
+typedef struct G9001T16 {
+    bool running;
+    uint16_t counter;
+    uint16_t ca;
+    uint16_t cb;
+    uint8_t ctl;
+    uint64_t frac;                  /* fractional count accumulator */
+    uint64_t last_ns;
+} G9001T16;
 
 typedef struct G9001State {
     uint8_t io[G9001_IO_SIZE];
@@ -250,6 +262,7 @@ typedef struct G9001State {
     bool lcd_dirty;
     bool trace_io;
     bool trace_nand;
+    bool trace_irq;
 
     /* LCD */
     QemuConsole *con;
@@ -268,6 +281,11 @@ typedef struct G9001State {
     bool irq_active;
     uint8_t irq_vector;
     uint8_t irq_prio;
+
+    /* 16-bit timer channel 0 (system tick source) */
+    G9001T16 t16;
+    QEMUTimer *t16_timer;
+    uint32_t t16_hz;
 
     /* keyboard */
     uint8_t key_state[G9001_KEY_COLS][G9001_KEY_ROWS];
@@ -1048,10 +1066,14 @@ static void g9001_pc_sample_cb(void *opaque)
     G9001MachineState *gms = G9001_MACHINE(s->machine);
 
     info_report("g9001-pc: pc=0x%08x sp=0x%08x psr=0x%08x ttbr=0x%08x "
-                "lcd_ps=0x%02x madd=0x%08x",
+                "lcd_ps=0x%02x madd=0x%08x t16(ctl=0x%02x cnt=%u ca=%u cb=%u "
+                "ie=0x%02x il=0x%02x fl=0x%02x)",
                 g9001_current_pc(), s->cpu->env.sp, s->cpu->env.psr,
                 s->cpu->env.ttbr, s->io[G9001_IO_LCDC_PS],
-                g9001_lcdc32(s, G9001_IO_LCDC_MADD));
+                g9001_lcdc32(s, G9001_IO_LCDC_MADD),
+                s->t16.ctl, s->t16.counter, s->t16.ca, s->t16.cb,
+                s->io[G9001_IO_INT_E16T01], s->io[0x0266],
+                s->io[0x0282]);
     timer_mod(s->pc_sample_timer,
               qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
               gms->debug_pc_sample_ms);
@@ -1171,6 +1193,123 @@ static uint8_t g9001_port_pins(G9001State *s, unsigned port)
 }
 
 /* ------------------------------------------------------------------------- */
+/* interrupt controller + 16-bit timer 0                                     */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Only the sources the firmware actually uses are wired up so far.  Flag and
+ * enable registers share the bit layout; the ILC priority register holds two
+ * 4-bit levels per byte.  Vector numbers follow the S1C33 family layout that
+ * the BBK 9288 machine already uses (16TM0 compare B = 30, compare A = 31)
+ * and still have to be confirmed against manual table III.2.1.1.1.
+ */
+typedef struct G9001IrqSource {
+    uint16_t flag_off;
+    uint16_t enable_off;
+    uint16_t il_off;
+    uint8_t il_shift;
+    uint8_t bit;
+    uint8_t vector;
+    const char *name;
+} G9001IrqSource;
+
+static const G9001IrqSource g9001_irq_sources[] = {
+    { 0x0282, 0x0272, 0x0266, 0, 0x04, 30, "16TM0B" },
+    { 0x0282, 0x0272, 0x0266, 0, 0x08, 31, "16TM0A" },
+};
+
+static void g9001_update_irq(G9001State *s)
+{
+    unsigned i;
+    int best_level = 0;
+    uint8_t best_vector = 0;
+    bool found = false;
+
+    for (i = 0; i < ARRAY_SIZE(g9001_irq_sources); i++) {
+        const G9001IrqSource *src = &g9001_irq_sources[i];
+        uint8_t flags = s->io[src->flag_off];
+        uint8_t enables = s->io[src->enable_off];
+        unsigned level;
+
+        if (!(flags & src->bit) || !(enables & src->bit)) {
+            continue;
+        }
+        level = (s->io[src->il_off] >> src->il_shift) & 0x7;
+        if (!found || level > (unsigned)best_level) {
+            found = true;
+            best_level = level;
+            best_vector = src->vector;
+        }
+    }
+
+    if (s->cpu == NULL) {
+        return;
+    }
+    if (!found) {
+        s1c33_cpu_set_irq(CPU(s->cpu), false, 0, 0);
+        s->irq_active = false;
+        return;
+    }
+    if (s->trace_irq) {
+        info_report("g9001-irq: vector=%u level=%u pc=0x%08x", best_vector,
+                    best_level, g9001_current_pc());
+    }
+    s->irq_active = true;
+    s->irq_vector = best_vector;
+    s->irq_prio = best_level;
+    s1c33_cpu_set_irq(CPU(s->cpu), true, best_vector, best_level);
+}
+
+/* Advance the timer counter by the time elapsed since the last update. */
+static void g9001_t16_advance(G9001State *s)
+{
+    G9001T16 *t = &s->t16;
+    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t counts;
+    uint16_t period;
+
+    if (!t->running) {
+        t->last_ns = now;
+        return;
+    }
+    if (t->last_ns == 0 || now <= t->last_ns) {
+        t->last_ns = now;
+        return;
+    }
+    counts = (now - t->last_ns) * (uint64_t)s->t16_hz / 1000000000ull +
+             t->frac;
+    t->last_ns = now;
+    if (counts == 0) {
+        return;
+    }
+    t->frac = counts % (uint64_t)s->t16_hz / 2;
+    counts = MIN(counts, 4 * 65536ull);
+
+    period = t->cb != 0 ? t->cb : (t->ca != 0 ? t->ca : 0x10000);
+    while (counts-- > 0) {
+        t->counter++;
+        if (t->counter == t->ca) {
+            s->io[0x0282] |= 0x08;          /* compare A */
+        }
+        if (t->counter == t->cb) {
+            s->io[0x0282] |= 0x04;          /* compare B */
+        }
+        if (t->counter >= period) {
+            t->counter = 0;
+        }
+    }
+    g9001_update_irq(s);
+}
+
+static void g9001_t16_cb(void *opaque)
+{
+    G9001State *s = opaque;
+
+    g9001_t16_advance(s);
+    timer_mod(s->t16_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
+}
+
+/* ------------------------------------------------------------------------- */
 /* I/O register window                                                       */
 /* ------------------------------------------------------------------------- */
 
@@ -1217,6 +1356,12 @@ static uint64_t g9001_io_read(void *opaque, hwaddr offset, unsigned size)
             /* The init bit and the ready/busy status bits are self-clearing
              * on real silicon; the boot loader polls bits 4 and 3 here. */
             v = s->io[off] | G9001_SDRAMC_INI_READY;
+        } else if (off == G9001_IO_T16_0TC) {
+            g9001_t16_advance(s);
+            v = s->t16.counter & 0xff;
+        } else if (off == G9001_IO_T16_0TC + 1) {
+            g9001_t16_advance(s);
+            v = s->t16.counter >> 8;
         } else {
             v = s->io[off];
         }
@@ -1287,7 +1432,38 @@ static void g9001_io_write(void *opaque, hwaddr offset, uint64_t value,
         case G9001_IO_INT_FK01_FP03:
         case G9001_IO_INT_F16T01:
         case G9001_IO_INT_FLCDC:
+            g9001_t16_advance(s);
             s->io[off] &= ~v;
+            g9001_update_irq(s);
+            break;
+        case G9001_IO_INT_E16T01:
+            s->io[off] = v;
+            g9001_update_irq(s);
+            break;
+        case G9001_IO_T16_0CA:
+        case G9001_IO_T16_0CA + 1:
+        case G9001_IO_T16_0CB:
+        case G9001_IO_T16_0CB + 1:
+        case G9001_IO_T16_0CTL:
+        case G9001_IO_T16_0CTL + 1:
+            g9001_t16_advance(s);
+            s->io[off] = v;
+            s->t16.ca = s->io[G9001_IO_T16_0CA] |
+                        (s->io[G9001_IO_T16_0CA + 1] << 8);
+            s->t16.cb = s->io[G9001_IO_T16_0CB] |
+                        (s->io[G9001_IO_T16_0CB + 1] << 8);
+            s->t16.ctl = s->io[G9001_IO_T16_0CTL];
+            if ((s->t16.ctl & 0x01) != (s->t16.running ? 0x01 : 0)) {
+                s->t16.running = s->t16.ctl & 0x01;
+                s->t16.counter = 0;
+                s->t16.last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            }
+            break;
+        case G9001_IO_T16_0TC:
+        case G9001_IO_T16_0TC + 1:
+            s->io[off] = v;
+            s->t16.counter = s->io[G9001_IO_T16_0TC] |
+                             (s->io[G9001_IO_T16_0TC + 1] << 8);
             break;
         case G9001_IO_CMU_GATEDCLK0:
         case G9001_IO_CMU_GATEDCLK1:
@@ -1471,6 +1647,8 @@ static void g9001_init(MachineState *machine)
     s->nand.cached_page = -1;
     s->trace_io = gms->trace_io;
     s->trace_nand = gms->trace_nand;
+    s->trace_irq = gms->trace_irq;
+    s->t16_hz = gms->t16_hz;
     s->nand_ecc_offset = gms->nand_ecc_offset;
 
     memory_region_init_ram(&s->a0ram, NULL, "g9001.a0ram",
@@ -1545,6 +1723,10 @@ static void g9001_init(MachineState *machine)
                                                  &g9001_keyboard_handler);
     qemu_input_handler_activate(s->kbd_handler);
 
+    s->t16_hz = gms->t16_hz ?: 32768;
+    s->t16_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, g9001_t16_cb, s);
+    timer_mod(s->t16_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
+
     g9001_boot_from_nand(s);
 
     if (gms->debug_lcd_dump_ms != 0) {
@@ -1584,6 +1766,16 @@ static bool g9001_get_trace_nand(Object *obj, Error **errp)
 static void g9001_set_trace_nand(Object *obj, bool value, Error **errp)
 {
     G9001_MACHINE(obj)->trace_nand = value;
+}
+
+static bool g9001_get_trace_irq(Object *obj, Error **errp)
+{
+    return G9001_MACHINE(obj)->trace_irq;
+}
+
+static void g9001_set_trace_irq(Object *obj, bool value, Error **errp)
+{
+    G9001_MACHINE(obj)->trace_irq = value;
 }
 
 static char *g9001_get_nand_image(Object *obj, Error **errp)
@@ -1674,6 +1866,15 @@ static void g9001_machine_instance_init(Object *obj)
                              g9001_set_trace_nand);
     object_property_set_description(obj, "trace-nand",
                                     "Log NAND command/address/data activity");
+    object_property_add_bool(obj, "trace-irq", g9001_get_trace_irq,
+                             g9001_set_trace_irq);
+    object_property_set_description(obj, "trace-irq",
+                                    "Log every interrupt raised to the CPU");
+    object_property_add_uint32_ptr(obj, "t16-hz", &gms->t16_hz,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "t16-hz",
+                                    "16-bit timer 0 input clock in Hz "
+                                    "(default 32768, the OSC1 rate)");
     object_property_add_uint32_ptr(obj, "nand-cle-pin", &gms->nand_cle_pin,
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_set_description(obj, "nand-cle-pin",
