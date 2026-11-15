@@ -257,6 +257,13 @@ typedef struct G9001MachineState {
     uint32_t debug_boot_mode;       /* value left at A0RAM 0x221 */
     uint32_t debug_key_col;         /* held key column, 0xffffffff = none */
     uint32_t debug_key_row;         /* held key row */
+    uint32_t debug_gpio_low_port;   /* port whose inputs are forced */
+    uint32_t debug_gpio_low_mask;
+    char *spi_image_path;
+    char *mmc_cid_hex;
+    char *mmc_csd_hex;
+    uint32_t mmc_capacity_mb;
+    bool debug_spi_test;
     bool debug_force_event;
     bool debug_lcd_test;
     uint32_t nand_cle_pin;          /* port * 8 + bit, 0xffffffff = not wired */
@@ -276,6 +283,57 @@ typedef struct G9001T16 {
     uint64_t last_ns;
 } G9001T16;
 
+typedef struct G9001Mmc {
+    int fd;
+    uint64_t size;                  /* image size in bytes */
+    uint32_t capacity_mb;
+    bool high_capacity;
+
+    uint8_t cid[16];
+    uint8_t csd[16];
+
+    /* command collection */
+    uint8_t cmd[6];
+    unsigned cmd_len;
+    bool cmd_active;
+
+    /* response (CID/CSD replies are 1 + 16 bytes) */
+    uint8_t resp[24];
+    unsigned resp_len;
+    unsigned resp_pos;
+
+    /* data streaming */
+    bool data_out;
+    uint64_t data_lba;
+    uint32_t data_left;
+    bool data_token_sent;
+    bool data_crc_sent;
+    uint64_t xfers;
+} G9001Mmc;
+
+typedef struct G9001Spi {
+    uint32_t rxd;
+    uint32_t txd;
+    uint32_t ctl1;
+    uint32_t ctl2;
+    uint32_t wait;
+    uint32_t int_en;
+    uint32_t rxmk;
+    bool rxd_valid;
+} G9001Spi;
+
+#define G9001_SPI_CTL1_BPT_SHIFT 10
+#define G9001_SPI_CTL1_BPT_MASK  0x1fu
+#define G9001_SPI_STAT_BSYF      (1u << 6)
+#define G9001_SPI_STAT_TDEF      (1u << 4)
+#define G9001_SPI_STAT_RDOF      (1u << 3)
+#define G9001_SPI_STAT_RDFF      (1u << 2)
+
+#define G9001_MMC_DATA_TOKEN     0xfe
+#define G9001_MMC_START_TOKEN    0xfe
+#define G9001_MMC_IDLE_TOKEN     0xff
+
+
 typedef struct G9001State {
     uint8_t io[G9001_IO_SIZE];
     uint8_t lcdc_seen[G9001_IO_SIZE];
@@ -290,6 +348,8 @@ typedef struct G9001State {
     uint32_t debug_boot_mode;
     uint32_t debug_key_col;
     uint32_t debug_key_row;
+    uint32_t debug_gpio_low_port;
+    uint32_t debug_gpio_low_mask;
 
     /* LCD */
     QemuConsole *con;
@@ -308,6 +368,10 @@ typedef struct G9001State {
     bool irq_active;
     uint8_t irq_vector;
     uint8_t irq_prio;
+
+    /* SPI + MMC card */
+    G9001Spi spi;
+    G9001Mmc mmc;
 
     /* 16-bit timer channel 0 (system tick source) */
     G9001T16 t16;
@@ -1326,7 +1390,319 @@ static uint8_t g9001_port_pins(G9001State *s, unsigned port)
     if (port == 1 && s->debug_p1_low_mask != 0) {
         in &= ~(s->debug_p1_low_mask & 0xff);
     }
+    if (port == s->debug_gpio_low_port && s->debug_gpio_low_mask != 0) {
+        in &= ~(s->debug_gpio_low_mask & 0xff);
+    }
     return out | (in & ~dir);
+}
+
+/* ------------------------------------------------------------------------- */
+/* SPI + MMC/SD card (E08 SPI module at 0x301700, SPI mode card)             */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * The firmware talks to the dictionary MMC card through the E08 SPI module:
+ * write TXD -> the hardware shifts (BPT+1) bits out and back, read RXD.
+ * CS is a GPIO pin, so the model only has to answer byte-by-byte.
+ *
+ * CID/CSD are configurable because card identity is exactly what the
+ * "why does a cloned card not work" investigation needs to vary.
+ */
+static void g9001_mmc_default_identity(G9001Mmc *m)
+{
+    static const uint8_t cid[16] = {
+        0x01, 0x53, 0x49, 0x49, 0x47, 0x39, 0x30, 0x30,
+        0x31, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    };
+    /* CSD v1.0: 128 MiB, 512-byte blocks, 8-bit, 25 MHz */
+    static const uint8_t csd[16] = {
+        0x00, 0x2d, 0x00, 0x32, 0x13, 0x59, 0x83, 0xb9,
+        0xed, 0xcf, 0xff, 0x92, 0x40, 0x40, 0x00, 0x2b,
+    };
+
+    memcpy(m->cid, cid, sizeof(cid));
+    memcpy(m->csd, csd, sizeof(csd));
+}
+
+static void g9001_mmc_update_csd(G9001Mmc *m)
+{
+    /*
+     * Rewrite the capacity fields for the configured size:
+     * MMC CSD v1.0: C_SIZE[73:62] = (capacity_bytes / 512 / 1024) - 1
+     * with READ_BL_LEN = 9 (512 bytes).
+     */
+    uint32_t blocks = m->capacity_mb * 1024u * 1024u / 512u;
+    uint32_t c_size = blocks / 1024u - 1u;
+
+    m->csd[4] = (m->csd[4] & 0x03) | ((c_size >> 10) & 0xfc);
+    m->csd[5] = (c_size >> 2) & 0xff;
+    m->csd[6] = (m->csd[6] & 0x03) | ((c_size & 0x03) << 6);
+    m->csd[5] = (m->csd[5] & 0xf0) | 0x03;
+}
+
+static void g9001_mmc_open(G9001State *s, const char *path)
+{
+    G9001Mmc *m = &s->mmc;
+    struct stat st;
+
+    m->fd = -1;
+    m->size = 0;
+    if (path == NULL || path[0] == 0) {
+        return;
+    }
+    m->fd = open(path, O_RDONLY | O_BINARY);
+    if (m->fd < 0) {
+        error_report("g9001: cannot open SPI card image '%s': %s", path,
+                     strerror(errno));
+        return;
+    }
+    if (fstat(m->fd, &st) == 0) {
+        m->size = st.st_size;
+    }
+    info_report("g9001: SPI card image '%s' %" PRIu64 " bytes", path, m->size);
+}
+
+static uint32_t g9001_mmc_bits_per_transfer(const G9001Spi *spi)
+{
+    unsigned bpt = (spi->ctl1 >> G9001_SPI_CTL1_BPT_SHIFT) &
+                   G9001_SPI_CTL1_BPT_MASK;
+    return bpt + 1;
+}
+
+static uint8_t g9001_mmc_byte(G9001State *s, uint8_t out)
+{
+    G9001Mmc *m = &s->mmc;
+
+    m->xfers++;
+
+    /* response bytes waiting? */
+    if (m->resp_pos < m->resp_len) {
+        return m->resp[m->resp_pos++];
+    }
+
+    /* streaming data block out? */
+    if (m->data_out) {
+        if (!m->data_token_sent) {
+            m->data_token_sent = true;
+            return G9001_MMC_START_TOKEN;
+        }
+        if (m->data_left > 0) {
+            uint8_t v = 0xff;
+
+            if (m->fd >= 0) {
+                off_t off = (off_t)(m->data_lba * 512 + (512 - m->data_left));
+                if ((uint64_t)off < m->size && read(m->fd, &v, 1) < 0) {
+                    v = 0xff;
+                } else if ((uint64_t)off < m->size) {
+                    lseek(m->fd, off, SEEK_SET);
+                    if (read(m->fd, &v, 1) != 1) {
+                        v = 0xff;
+                    }
+                }
+            }
+            m->data_left--;
+            return v;
+        }
+        if (!m->data_crc_sent) {
+            m->data_crc_sent = true;
+            return 0xff;            /* CRC byte 1 */
+        }
+        if (m->data_crc_sent && m->data_left == 0) {
+            m->data_out = false;    /* CRC byte 2 ends the stream */
+            return 0xff;
+        }
+    }
+
+    /* collect a command */
+    if (m->cmd_active) {
+        if (m->cmd_len < 6) {
+            m->cmd[m->cmd_len++] = out;
+        }
+        if (m->cmd_len == 6) {
+            uint8_t op = m->cmd[0] & 0x3f;
+            uint32_t arg = ((uint32_t)m->cmd[1] << 24) |
+                           ((uint32_t)m->cmd[2] << 16) |
+                           ((uint32_t)m->cmd[3] << 8) | m->cmd[4];
+
+            m->cmd_active = false;
+            m->resp_pos = 0;
+            m->resp_len = 0;
+            switch (op) {
+            case 0:             /* GO_IDLE_STATE */
+                m->resp[0] = 0x01;
+                m->resp_len = 1;
+                break;
+            case 1:             /* SEND_OP_COND */
+                m->resp[0] = 0x00;
+                m->resp_len = 1;
+                break;
+            case 8:             /* SEND_IF_COND: R7 = R1 + echo */
+                m->resp[0] = 0x01;
+                m->resp[1] = (arg >> 24) & 0xff;
+                m->resp[2] = (arg >> 16) & 0xff;
+                m->resp[3] = (arg >> 8) & 0xff;
+                m->resp[4] = arg & 0xff;
+                m->resp_len = 5;
+                break;
+            case 9:             /* SEND_CSD */
+                m->resp[0] = 0x00;
+                memcpy(m->resp + 1, m->csd, 16);
+                m->resp_len = 17;
+                break;
+            case 10:            /* SEND_CID */
+                m->resp[0] = 0x00;
+                memcpy(m->resp + 1, m->cid, 16);
+                m->resp_len = 17;
+                break;
+            case 12:            /* STOP_TRANSMISSION */
+            case 16:            /* SET_BLOCKLEN */
+            case 55:            /* APP_CMD */
+            case 59:
+                m->resp[0] = 0x00;
+                m->resp_len = 1;
+                break;
+            case 13:            /* SEND_STATUS */
+                m->resp[0] = 0x00;
+                m->resp[1] = 0x00;
+                m->resp_len = 2;
+                break;
+            case 17:            /* READ_SINGLE_BLOCK */
+                m->resp[0] = 0x00;
+                m->resp_len = 1;
+                m->data_out = true;
+                m->data_lba = m->high_capacity ? arg : arg / 512;
+                m->data_left = 512;
+                m->data_token_sent = false;
+                m->data_crc_sent = false;
+                break;
+            case 18:            /* READ_MULTIPLE_BLOCK */
+                m->resp[0] = 0x00;
+                m->resp_len = 1;
+                m->data_out = true;
+                m->data_lba = m->high_capacity ? arg : arg / 512;
+                m->data_left = 512;
+                m->data_token_sent = false;
+                m->data_crc_sent = false;
+                break;
+            case 58:            /* READ_OCR */
+                m->resp[0] = 0x00;
+                m->resp[1] = 0x80;      /* power up done (bit 31) */
+                m->resp[2] = 0xff;
+                m->resp[3] = 0x80;
+                m->resp[4] = 0x00;
+                m->resp_len = 5;
+                break;
+            default:
+                m->resp[0] = 0x00;
+                m->resp_len = 1;
+                break;
+            }
+        }
+        return G9001_MMC_IDLE_TOKEN;
+    }
+
+    /* idle: 0xFF means "no response yet"; 0x40 starts a command */
+    if ((out & 0xc0) == 0x40) {
+        m->cmd[0] = out;
+        m->cmd_len = 1;
+        m->cmd_active = true;
+        return G9001_MMC_IDLE_TOKEN;
+    }
+    return G9001_MMC_IDLE_TOKEN;
+}
+
+static void g9001_spi_txd_write(G9001State *s, uint32_t value)
+{
+    G9001Spi *spi = &s->spi;
+    uint32_t bits = g9001_mmc_bits_per_transfer(spi);
+    uint32_t bytes = (bits + 7) / 8;
+    uint32_t rx = 0;
+    unsigned i;
+
+    if (bytes == 0) {
+        bytes = 1;
+    }
+    if (bytes > 4) {
+        bytes = 4;
+    }
+    for (i = 0; i < bytes; i++) {
+        uint32_t shift = 8 * (bytes - 1 - i);
+        uint8_t out = (value >> shift) & 0xff;
+        uint8_t in = g9001_mmc_byte(s, out);
+
+        rx |= (uint32_t)in << shift;
+    }
+    spi->rxd = rx;
+    spi->rxd_valid = true;
+}
+
+static uint32_t g9001_spi_stat(const G9001State *s)
+{
+    uint32_t v = G9001_SPI_STAT_TDEF;   /* transmitter never stalls */
+
+    if (s->spi.rxd_valid) {
+        v |= G9001_SPI_STAT_RDFF;
+    }
+    return v;
+}
+
+/*
+ * Scripted exchange through the same byte path the firmware uses, so the
+ * model can be validated without a guest driver:
+ *   CMD0  -> R1 = 0x01
+ *   CMD8  -> R7 = 0x01 00 00 01 aa
+ *   CMD10 -> R1 + 16 CID bytes
+ *   CMD17 -> R1 + 0xFE + 512 data bytes
+ */
+static void g9001_spi_selftest(G9001State *s)
+{
+    static const uint8_t cmd0[6] = { 0x40, 0x00, 0x00, 0x00, 0x00, 0x95 };
+    static const uint8_t cmd8[6] = { 0x48, 0x00, 0x00, 0x01, 0xaa, 0x87 };
+    static const uint8_t cmd10[6] = { 0x4a, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    static const uint8_t cmd17[6] = { 0x51, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    uint8_t r[24];
+    unsigned i;
+
+    for (i = 0; i < 6; i++) {
+        g9001_mmc_byte(s, cmd0[i]);
+    }
+    r[0] = g9001_mmc_byte(s, 0xff);
+    info_report("g9001-spi: CMD0  -> R1=0x%02x", r[0]);
+
+    for (i = 0; i < 6; i++) {
+        g9001_mmc_byte(s, cmd8[i]);
+    }
+    for (i = 0; i < 5; i++) {
+        r[i] = g9001_mmc_byte(s, 0xff);
+    }
+    info_report("g9001-spi: CMD8  -> R7=%02x %02x %02x %02x %02x",
+                r[0], r[1], r[2], r[3], r[4]);
+
+    for (i = 0; i < 6; i++) {
+        g9001_mmc_byte(s, cmd10[i]);
+    }
+    for (i = 0; i < 17; i++) {
+        r[i] = g9001_mmc_byte(s, 0xff);
+    }
+    info_report("g9001-spi: CMD10 -> R1=0x%02x CID=%02x%02x%02x%02x"
+                "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x", r[0],
+                r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10],
+                r[11], r[12], r[13], r[14], r[15], r[16]);
+
+    for (i = 0; i < 6; i++) {
+        g9001_mmc_byte(s, cmd17[i]);
+    }
+    for (i = 0; i < 10; i++) {
+        r[i] = g9001_mmc_byte(s, 0xff);
+    }
+    info_report("g9001-spi: CMD17 -> R1=0x%02x token=0x%02x data=%02x %02x "
+                "%02x %02x %02x %02x %02x %02x", r[0], r[1], r[2], r[3],
+                r[4], r[5], r[6], r[7], r[8], r[9]);
+    for (i = 0; i < 512 - 8; i++) {
+        (void)g9001_mmc_byte(s, 0xff);
+    }
+    (void)g9001_mmc_byte(s, 0xff);
+    (void)g9001_mmc_byte(s, 0xff);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1487,10 +1863,15 @@ static uint64_t g9001_io_read(void *opaque, hwaddr offset, unsigned size)
             } else if (s->debug_usbctl == 2) {
                 v &= 0x7f;
             }
-        } else if (off == G9001_IO_SPI_STAT) {
-            v = 0x02;           /* Tx empty: card transfers never block */
-        } else if (off == G9001_IO_SPI_RXD) {
-            v = 0xff;
+        } else if (off == G9001_IO_SPI_STAT ||
+                   off == G9001_IO_SPI_STAT + 1 ||
+                   off == G9001_IO_SPI_STAT + 2 ||
+                   off == G9001_IO_SPI_STAT + 3) {
+            uint32_t st = g9001_spi_stat(s);
+
+            v = (st >> (8 * (off - G9001_IO_SPI_STAT))) & 0xff;
+        } else if (off >= G9001_IO_SPI_RXD && off < G9001_IO_SPI_RXD + 4) {
+            v = (s->spi.rxd >> (8 * (off - G9001_IO_SPI_RXD))) & 0xff;
         } else if (off >= G9001_IO_ECC0_BASE &&
                    off < G9001_IO_ECC0_BASE + ARRAY_SIZE(s->nand_ecc)) {
             /*
@@ -1620,6 +2001,28 @@ static void g9001_io_write(void *opaque, hwaddr offset, uint64_t value,
             break;
         case G9001_IO_SDRAMC_INI:
             s->io[off] = v;
+            break;
+        case G9001_IO_SPI_TXD:
+        case G9001_IO_SPI_TXD + 1:
+        case G9001_IO_SPI_TXD + 2:
+        case G9001_IO_SPI_TXD + 3:
+            s->io[off] = v;
+            s->spi.txd = ldl_le_p(&s->io[G9001_IO_SPI_TXD]);
+            g9001_spi_txd_write(s, s->spi.txd);
+            break;
+        case G9001_IO_SPI_CTL1:
+        case G9001_IO_SPI_CTL1 + 1:
+        case G9001_IO_SPI_CTL1 + 2:
+        case G9001_IO_SPI_CTL1 + 3:
+            s->io[off] = v;
+            s->spi.ctl1 = ldl_le_p(&s->io[G9001_IO_SPI_CTL1]);
+            break;
+        case G9001_IO_SPI_RXD:
+        case G9001_IO_SPI_RXD + 1:
+        case G9001_IO_SPI_RXD + 2:
+        case G9001_IO_SPI_RXD + 3:
+            /* clear the receive flag on read */
+            s->spi.rxd_valid = false;
             break;
         case G9001_IO_CARDSETUP:
             s->io[off] = v;
@@ -1863,6 +2266,43 @@ static void g9001_init(MachineState *machine)
     s->trace_io = gms->trace_io;
     s->trace_nand = gms->trace_nand;
     s->trace_nand_kernel = gms->trace_nand_kernel;
+    g9001_mmc_default_identity(&s->mmc);
+    s->mmc.capacity_mb = gms->mmc_capacity_mb ? gms->mmc_capacity_mb : 128;
+    if (gms->mmc_cid_hex != NULL) {
+        unsigned char b[16];
+        if (sscanf(gms->mmc_cid_hex,
+                   "%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx"
+                   "%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx",
+                   &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6], &b[7],
+                   &b[8], &b[9], &b[10], &b[11], &b[12], &b[13], &b[14],
+                   &b[15]) == 16) {
+            memcpy(s->mmc.cid, b, 16);
+        } else {
+            warn_report("bad mmc-cid-hex, keeping default CID");
+        }
+    }
+    if (gms->mmc_csd_hex != NULL) {
+        unsigned char b[16];
+        if (sscanf(gms->mmc_csd_hex,
+                   "%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx"
+                   "%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx",
+                   &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6], &b[7],
+                   &b[8], &b[9], &b[10], &b[11], &b[12], &b[13], &b[14],
+                   &b[15]) == 16) {
+            memcpy(s->mmc.csd, b, 16);
+        } else {
+            warn_report("bad mmc-csd-hex, keeping default CSD");
+        }
+    } else {
+        g9001_mmc_update_csd(&s->mmc);
+    }
+    s->spi.ctl1 = 7u << G9001_SPI_CTL1_BPT_SHIFT;   /* 8-bit transfers */
+    g9001_mmc_open(s, gms->spi_image_path);
+    if (gms->debug_spi_test) {
+        g9001_spi_selftest(s);
+    }
+    s->debug_gpio_low_port = gms->debug_gpio_low_port;
+    s->debug_gpio_low_mask = gms->debug_gpio_low_mask;
     s->debug_key_col = gms->debug_key_col;
     s->debug_key_row = gms->debug_key_row;
     if (gms->debug_key_col < G9001_KEY_COLS &&
@@ -2056,6 +2496,55 @@ static void g9001_set_nand_save(Object *obj, bool value, Error **errp)
     G9001_MACHINE(obj)->nand_save = value;
 }
 
+static char *g9001_get_spi_image(Object *obj, Error **errp)
+{
+    return g_strdup(G9001_MACHINE(obj)->spi_image_path);
+}
+
+static void g9001_set_spi_image(Object *obj, const char *value, Error **errp)
+{
+    G9001MachineState *gms = G9001_MACHINE(obj);
+
+    g_free(gms->spi_image_path);
+    gms->spi_image_path = g_strdup(value);
+}
+
+static char *g9001_get_mmc_cid(Object *obj, Error **errp)
+{
+    return g_strdup(G9001_MACHINE(obj)->mmc_cid_hex);
+}
+
+static void g9001_set_mmc_cid(Object *obj, const char *value, Error **errp)
+{
+    G9001MachineState *gms = G9001_MACHINE(obj);
+
+    g_free(gms->mmc_cid_hex);
+    gms->mmc_cid_hex = g_strdup(value);
+}
+
+static char *g9001_get_mmc_csd(Object *obj, Error **errp)
+{
+    return g_strdup(G9001_MACHINE(obj)->mmc_csd_hex);
+}
+
+static void g9001_set_mmc_csd(Object *obj, const char *value, Error **errp)
+{
+    G9001MachineState *gms = G9001_MACHINE(obj);
+
+    g_free(gms->mmc_csd_hex);
+    gms->mmc_csd_hex = g_strdup(value);
+}
+
+static bool g9001_get_spi_test(Object *obj, Error **errp)
+{
+    return G9001_MACHINE(obj)->debug_spi_test;
+}
+
+static void g9001_set_spi_test(Object *obj, bool value, Error **errp)
+{
+    G9001_MACHINE(obj)->debug_spi_test = value;
+}
+
 static bool g9001_get_kernel_4k(Object *obj, Error **errp)
 {
     return G9001_MACHINE(obj)->nand_kernel_4k;
@@ -2096,6 +2585,9 @@ static void g9001_machine_instance_init(Object *obj)
     gms->nand_cle_pin = 2;          /* P0.2 = CLE  */
     gms->nand_ale_pin = 3;          /* P0.3 = ALE  */
     gms->nand_ryby_pin = 4 * 8 + 0; /* P4.0 = RY/#BY */
+    gms->debug_gpio_low_port = 0xffffffff;
+    gms->mmc_capacity_mb = 128;
+    gms->debug_gpio_low_mask = 0;
     gms->debug_key_col = 0xffffffff;
     gms->debug_key_row = 0xffffffff;
     gms->nand_ecc_offset = G9001_NAND_RAW_PAGE - 8;
@@ -2171,6 +2663,38 @@ static void g9001_machine_instance_init(Object *obj)
     object_property_set_description(obj, "debug-boot-mode",
                                     "Byte left at A0RAM 0x221 for the second "
                                     "stage (0x400d48 compares it with 1)");
+    object_property_add_str(obj, "spi-image",
+                            g9001_get_spi_image, g9001_set_spi_image);
+    object_property_set_description(obj, "spi-image",
+                                    "Raw SD/MMC card image served in SPI mode");
+    object_property_add_str(obj, "mmc-cid-hex",
+                            g9001_get_mmc_cid, g9001_set_mmc_cid);
+    object_property_set_description(obj, "mmc-cid-hex",
+                                    "32 hex digits: card CID (identity)");
+    object_property_add_str(obj, "mmc-csd-hex",
+                            g9001_get_mmc_csd, g9001_set_mmc_csd);
+    object_property_set_description(obj, "mmc-csd-hex",
+                                    "32 hex digits: card CSD (capacity/flags)");
+    object_property_add_uint32_ptr(obj, "mmc-capacity-mb",
+                                   &gms->mmc_capacity_mb,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "mmc-capacity-mb",
+                                    "Capacity programmed into a default CSD");
+    object_property_add_bool(obj, "debug-spi-test",
+                             g9001_get_spi_test, g9001_set_spi_test);
+    object_property_set_description(obj, "debug-spi-test",
+                                    "Run a scripted CMD0/8/10/17 exchange "
+                                    "through the SPI model and log it");
+    object_property_add_uint32_ptr(obj, "debug-gpio-low-port",
+                                   &gms->debug_gpio_low_port,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "debug-gpio-low-port",
+                                    "P<n> whose input pins are forced low");
+    object_property_add_uint32_ptr(obj, "debug-gpio-low-mask",
+                                   &gms->debug_gpio_low_mask,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "debug-gpio-low-mask",
+                                    "Bit mask of pins forced low on that port");
     object_property_add_uint32_ptr(obj, "debug-key-col",
                                    &gms->debug_key_col,
                                    OBJ_PROP_FLAG_READWRITE);
