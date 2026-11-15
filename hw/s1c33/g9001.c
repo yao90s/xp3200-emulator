@@ -246,6 +246,14 @@ typedef struct G9001Nand {
     bool ignore_ecc;                /* report a blank (all-FF) spare */
     bool spare_real;                /* direct spare reads bypass ignore_ecc */
     bool program_loaded;
+
+    /*
+     * The dump skipped the chip's bad blocks, so the firmware's physical block
+     * numbers are ahead of the dump indices by the number of skipped blocks.
+     * These are the *device* block numbers that are absent from the dump.
+     */
+    uint32_t bad_blocks[16];
+    unsigned bad_count;
 } G9001Nand;
 
 typedef struct G9001MachineState {
@@ -253,6 +261,7 @@ typedef struct G9001MachineState {
 
     char *nand_image_path;
     uint32_t nand_id;
+    char *nand_bad_blocks;
     bool nand_save;
     bool nand_small_page;
     char *debug_lcd_dump_path;
@@ -376,6 +385,7 @@ typedef struct G9001State {
     QemuConsole *con;
     uint32_t lcd_present_seq;
     int64_t lcd_last_dump;
+    uint32_t nand_max_row;          /* highest page row the firmware read */
 
     /* NAND */
     G9001Nand nand;
@@ -556,12 +566,50 @@ static void g9001_nand_close(G9001State *s)
     }
 }
 
-static bool g9001_nand_load_page(G9001State *s, uint32_t page)
+/*
+ * The dump was taken with the chip's bad blocks skipped, so the firmware's
+ * physical block numbers are ahead of the dump indices by the number of bad
+ * blocks below them.  Translate a *device* page number to a dump page number;
+ * reads of a bad block itself come back erased (all 0xFF).
+ */
+static uint32_t g9001_nand_xlate(G9001State *s, uint32_t row, bool *bad)
+{
+    G9001Nand *n = &s->nand;
+    uint32_t blk = row / G9001_NAND_PAGES_BLOCK;
+    uint32_t pg = row % G9001_NAND_PAGES_BLOCK;
+    uint32_t skipped = 0;
+    unsigned i;
+
+    *bad = false;
+    if (n->bad_count == 0) {
+        return row;
+    }
+    for (i = 0; i < n->bad_count; i++) {
+        if (n->bad_blocks[i] == blk) {
+            *bad = true;
+            return 0;
+        }
+        if (n->bad_blocks[i] < blk) {
+            skipped++;
+        }
+    }
+    return (blk - skipped) * G9001_NAND_PAGES_BLOCK + pg;
+}
+
+static bool g9001_nand_load_page(G9001State *s, uint32_t row)
 {
     G9001Nand *n = &s->nand;
     off_t off;
     ssize_t got;
+    uint32_t page;
+    bool bad;
 
+    page = g9001_nand_xlate(s, row, &bad);
+    if (bad) {
+        memset(n->page, 0xff, n->page_size ? n->page_size : sizeof(n->page));
+        n->cached_page = -1;
+        return false;
+    }
     if (n->cached_page == (int64_t)page) {
         return true;
     }
@@ -606,11 +654,6 @@ static void g9001_nand_store_page(G9001State *s)
         (void)wrote;
     }
     n->page_dirty = false;
-}
-
-static uint32_t g9001_nand_page_of(uint32_t row)
-{
-    return row;
 }
 
 static void g9001_nand_reset(G9001State *s)
@@ -672,6 +715,9 @@ static void g9001_nand_latch_addr(G9001State *s)
         break;
     default:
         break;
+    }
+    if (n->row > s->nand_max_row) {
+        s->nand_max_row = n->row;
     }
     if (s->trace_nand && n->addr_count) {
         info_report("g9001-nand: latch %u bytes -> col=%u row=%u "
@@ -745,7 +791,6 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
                             bool write, uint8_t *value)
 {
     G9001Nand *n = &s->nand;
-    uint32_t page;
 
     if (command) {
         n->cmd = *value;
@@ -763,8 +808,7 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
         case 0x30:
             /* read confirm: latch address and load the page */
             g9001_nand_latch_addr(s);
-            page = g9001_nand_page_of(n->row);
-            g9001_nand_load_page(s, page);
+            g9001_nand_load_page(s, n->row);
             n->data_ptr = n->col;
         n->raw_stream = n->col >= n->data_size;
             n->data_end = g9001_nand_stream_size(n);
@@ -776,8 +820,7 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
             break;
         case 0x10:
             g9001_nand_latch_addr(s);
-            page = g9001_nand_page_of(n->row);
-            g9001_nand_load_page(s, page);
+            g9001_nand_load_page(s, n->row);
             n->data_ptr = n->col;
         n->raw_stream = n->col >= n->data_size;
             n->data_end = g9001_nand_stream_size(n);
@@ -796,8 +839,7 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
                     n->row = n->addr[1] | (n->addr[2] << 8);
                 }
             }
-            page = (n->row & ~(G9001_NAND_PAGES_BLOCK - 1));
-            g9001_nand_load_page(s, page);
+            g9001_nand_load_page(s, n->row & ~(G9001_NAND_PAGES_BLOCK - 1));
             memset(n->page, 0xff, sizeof(n->page));
             n->page_dirty = true;
             g9001_nand_store_page(s);
@@ -858,7 +900,7 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
                 g9001_nand_latch_addr(s);
                 n->data_ptr = n->col;
         n->raw_stream = n->col >= n->data_size;
-                g9001_nand_load_page(s, g9001_nand_page_of(n->row));
+                g9001_nand_load_page(s, n->row);
             }
             if (n->raw_stream) {
                 if (n->data_ptr < n->page_size) {
@@ -890,7 +932,7 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
      */
     if (n->addr_count != 0 && n->phase != G9001_NAND_RANDOM_COL) {
         g9001_nand_latch_addr(s);
-        g9001_nand_load_page(s, g9001_nand_page_of(n->row));
+        g9001_nand_load_page(s, n->row);
         n->data_ptr = n->col;
         n->raw_stream = n->col >= n->data_size;
         n->data_end = g9001_nand_stream_size(n);
@@ -1413,7 +1455,8 @@ static void g9001_pc_sample_cb(void *opaque)
 
     info_report("g9001-pc: pc=0x%08x sp=0x%08x psr=0x%08x ttbr=0x%08x "
                 "lcd_ps=0x%02x madd=0x%08x disp=0x%08x a0221=0x%02x "
-                "a03f3=0x%02x card=%" PRIu64 "/%" PRIu64 " t16(ctl=0x%02x "
+                "a03f3=0x%02x card=%" PRIu64 "/%" PRIu64 " maxrow=%u "
+                "t16(ctl=0x%02x "
                 "cnt=%u ca=%u cb=%u ie=0x%02x il=0x%02x fl=0x%02x)",
                 g9001_current_pc(), s->cpu->env.sp, s->cpu->env.psr,
                 s->cpu->env.ttbr, s->io[G9001_IO_LCDC_PS],
@@ -1421,7 +1464,7 @@ static void g9001_pc_sample_cb(void *opaque)
                 s->a0ram_ptr != NULL ? ldl_le_p(s->a0ram_ptr + 0x678) : 0,
                 s->a0ram_ptr != NULL ? s->a0ram_ptr[0x221] : 0,
                 s->a0ram_ptr != NULL ? s->a0ram_ptr[0x3f3] : 0,
-                s->card_reads, s->card_writes,
+                s->card_reads, s->card_writes, s->nand_max_row,
                 s->t16.ctl, s->t16.counter, s->t16.ca, s->t16.cb,
                 s->io[G9001_IO_INT_E16T01], s->io[0x0266],
                 s->io[0x0282]);
@@ -2571,6 +2614,25 @@ static void g9001_init(MachineState *machine)
     s->nand_ecc_offset = gms->nand_ecc_offset;
     s->nand.ignore_ecc = gms->nand_ignore_ecc;
     s->nand.spare_real = gms->nand_spare_real;
+    if (gms->nand_bad_blocks != NULL) {
+        const char *p = gms->nand_bad_blocks;
+
+        while (*p != 0 && s->nand.bad_count < ARRAY_SIZE(s->nand.bad_blocks)) {
+            char *end = NULL;
+            unsigned long v = strtoul(p, &end, 0);
+
+            if (end == p) {
+                break;
+            }
+            s->nand.bad_blocks[s->nand.bad_count++] = (uint32_t)v;
+            p = end;
+            while (*p == ',' || *p == ':' || *p == ' ') {
+                p++;
+            }
+        }
+        info_report("g9001: NAND bad blocks skipped by the dump: %u", 
+                    s->nand.bad_count);
+    }
 
     memory_region_init_ram(&s->a0ram, NULL, "g9001.a0ram",
                            G9001_A0RAM_SIZE, &error_fatal);
@@ -2839,6 +2901,20 @@ static void g9001_set_nand_spare_real(Object *obj, bool value, Error **errp)
     G9001_MACHINE(obj)->nand_spare_real = value;
 }
 
+static char *g9001_get_nand_bad_blocks(Object *obj, Error **errp)
+{
+    return g_strdup(G9001_MACHINE(obj)->nand_bad_blocks);
+}
+
+static void g9001_set_nand_bad_blocks(Object *obj, const char *value,
+                                      Error **errp)
+{
+    G9001MachineState *gms = G9001_MACHINE(obj);
+
+    g_free(gms->nand_bad_blocks);
+    gms->nand_bad_blocks = g_strdup(value);
+}
+
 static bool g9001_get_slp_as_nop(Object *obj, Error **errp)
 {
     return G9001_MACHINE(obj)->slp_as_nop;
@@ -3060,6 +3136,15 @@ static void g9001_machine_instance_init(Object *obj)
                                     "ECC bytes but return the stored spare "
                                     "bytes when the firmware reads the spare "
                                     "area directly (column >= page data size)");
+    object_property_add_str(obj, "nand-bad-blocks",
+                            g9001_get_nand_bad_blocks,
+                            g9001_set_nand_bad_blocks);
+    object_property_set_description(obj, "nand-bad-blocks",
+                                    "Comma separated *device* block numbers "
+                                    "that the NAND dump skipped (bad blocks). "
+                                    "The model subtracts them so the firmware's "
+                                    "physical block numbers land on the right "
+                                    "dump blocks");
     object_property_add_bool(obj, "nand-kernel-4k",
                              g9001_get_kernel_4k, g9001_set_kernel_4k);
     object_property_set_description(obj, "nand-kernel-4k",
@@ -3113,6 +3198,7 @@ static void g9001_machine_instance_finalize(Object *obj)
     G9001MachineState *gms = G9001_MACHINE(obj);
 
     g_free(gms->nand_image_path);
+    g_free(gms->nand_bad_blocks);
     g_free(gms->debug_lcd_dump_path);
     if (g9001_active != NULL) {
         g9001_nand_close(g9001_active);
