@@ -248,6 +248,7 @@ typedef struct G9001Nand {
     bool program_loaded;
     bool spare_stream;              /* col >= data_size stays in the stream */
     bool spare_per_sector;          /* spare holds 16 bytes per 512B sector */
+    bool spare_lba;                 /* keep the block bookkeeping bytes */
     GHashTable *written;            /* page -> programmed bytes (RAM overlay) */
 
     /*
@@ -303,6 +304,7 @@ typedef struct G9001MachineState {
     bool nand_kernel_4k;
     bool nand_ignore_ecc;
     bool nand_ecc_gen;
+    bool nand_spare_lba;
     bool nand_spare_real;
     bool nand_spare_stream;
     bool nand_spare_per_sector;
@@ -1077,7 +1079,11 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
                      0xff;
             if (n->ignore_ecc && !n->spare_real &&
                 n->data_ptr >= n->data_size) {
-                *value = 0xff;
+                unsigned rel = n->data_ptr - n->data_size;
+
+                if (!n->spare_lba || (rel % G9001_NAND_SPARE_PER_SECTOR) >= 8) {
+                    *value = 0xff;
+                }
             }
             n->data_ptr++;
         } else if (n->data_ptr < g9001_nand_stream_size(n)) {
@@ -2782,6 +2788,7 @@ static void g9001_init(MachineState *machine)
     s->nand.spare_real = gms->nand_spare_real;
     s->nand.spare_stream = gms->nand_spare_stream;
     s->nand.spare_per_sector = gms->nand_spare_per_sector;
+    s->nand.spare_lba = gms->nand_spare_lba;
     if (gms->nand_bad_blocks != NULL) {
         const char *p = gms->nand_bad_blocks;
 
@@ -3079,6 +3086,16 @@ static void g9001_set_nand_ecc_gen(Object *obj, bool value, Error **errp)
     G9001_MACHINE(obj)->nand_ecc_gen = value;
 }
 
+static bool g9001_get_nand_spare_lba(Object *obj, Error **errp)
+{
+    return G9001_MACHINE(obj)->nand_spare_lba;
+}
+
+static void g9001_set_nand_spare_lba(Object *obj, bool value, Error **errp)
+{
+    G9001_MACHINE(obj)->nand_spare_lba = value;
+}
+
 static bool g9001_get_nand_spare_real(Object *obj, Error **errp)
 {
     return G9001_MACHINE(obj)->nand_spare_real;
@@ -3351,6 +3368,13 @@ static void g9001_machine_instance_init(Object *obj)
                                     "generator (manual V.4.6) in pECC0CP.. "
                                     "pECC1LPH instead of echoing the stored "
                                     "parity bytes");
+    object_property_add_bool(obj, "nand-spare-lba",
+                             g9001_get_nand_spare_lba,
+                             g9001_set_nand_spare_lba);
+    object_property_set_description(obj, "nand-spare-lba",
+                                    "With nand-ignore-ecc, keep the eight "
+                                    "block bookkeeping bytes of each 16-byte "
+                                    "spare group real and blank only the ECC");
     object_property_add_bool(obj, "nand-spare-real",
                              g9001_get_nand_spare_real,
                              g9001_set_nand_spare_real);
