@@ -269,6 +269,7 @@ typedef struct G9001MachineState {
     uint32_t debug_dump_addr;
     uint32_t debug_dump_size;
     uint32_t debug_dump_ms;
+    uint32_t debug_exit_on_stall_ms;
     char *debug_dump_path;
     char *spi_image_path;
     char *mmc_cid_hex;
@@ -386,6 +387,9 @@ typedef struct G9001State {
     bool hsdma_busy;
     QEMUTimer *dump_timer;
     bool dump_done;
+    QEMUTimer *stall_timer;
+    uint64_t stall_last;
+    unsigned stall_count;
 
     /* SPI + MMC card */
     G9001Spi spi;
@@ -1199,6 +1203,32 @@ static const GraphicHwOps g9001_lcd_ops = {
     .invalidate = g9001_lcd_invalidate,
     .gfx_update = g9001_lcd_update,
 };
+
+static void g9001_stall_check(void *opaque)
+{
+    G9001State *s = opaque;
+    G9001MachineState *gms = G9001_MACHINE(s->machine);
+    uint64_t progress = s->card_reads + s->card_writes + s->hsdma_copies;
+
+    if (progress == s->stall_last) {
+        s->stall_count++;
+    } else {
+        s->stall_count = 0;
+        s->stall_last = progress;
+    }
+    if (s->stall_count >= 4) {
+        info_report("g9001-stall: no NAND progress for %u ticks; "
+                    "card=%" PRIu64 "/%" PRIu64 " hsdma=%" PRIu64
+                    " pc=0x%08x", s->stall_count, s->card_reads,
+                    s->card_writes, s->hsdma_copies, g9001_current_pc());
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+        return;
+    }
+    timer_mod(s->stall_timer,
+              qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+              (gms->debug_exit_on_stall_ms ? gms->debug_exit_on_stall_ms :
+               1000));
+}
 
 static void g9001_mem_dump(void *opaque)
 {
@@ -2449,6 +2479,13 @@ static void g9001_init(MachineState *machine)
     }
     s->spi.ctl1 = 7u << G9001_SPI_CTL1_BPT_SHIFT;   /* 8-bit transfers */
     g9001_mmc_open(s, gms->spi_image_path);
+    if (gms->debug_exit_on_stall_ms != 0) {
+        s->stall_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, g9001_stall_check,
+                                      s);
+        timer_mod(s->stall_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                  gms->debug_exit_on_stall_ms);
+    }
     if (gms->debug_dump_path != NULL && gms->debug_dump_size != 0) {
         s->dump_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, g9001_mem_dump, s);
         timer_mod(s->dump_timer,
@@ -2835,6 +2872,12 @@ static void g9001_machine_instance_init(Object *obj)
     object_property_set_description(obj, "debug-boot-mode",
                                     "Byte left at A0RAM 0x221 for the second "
                                     "stage (0x400d48 compares it with 1)");
+    object_property_add_uint32_ptr(obj, "debug-exit-on-stall-ms",
+                                   &gms->debug_exit_on_stall_ms,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "debug-exit-on-stall-ms",
+                                    "Shut down once the guest stops issuing "
+                                    "NAND work for a few intervals");
     object_property_add_uint32_ptr(obj, "debug-dump-mem-addr",
                                    &gms->debug_dump_addr,
                                    OBJ_PROP_FLAG_READWRITE);
