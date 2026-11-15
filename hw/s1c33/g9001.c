@@ -255,6 +255,8 @@ typedef struct G9001MachineState {
     uint32_t debug_p1_low_mask;     /* force P1 input bits low */
     uint32_t debug_usbctl;          /* 0=as written, 1=bit7 set, 2=bit7 clear */
     uint32_t debug_boot_mode;       /* value left at A0RAM 0x221 */
+    uint32_t debug_key_col;         /* held key column, 0xffffffff = none */
+    uint32_t debug_key_row;         /* held key row */
     bool debug_force_event;
     bool debug_lcd_test;
     uint32_t nand_cle_pin;          /* port * 8 + bit, 0xffffffff = not wired */
@@ -286,6 +288,8 @@ typedef struct G9001State {
     uint32_t debug_p1_low_mask;
     uint32_t debug_usbctl;
     uint32_t debug_boot_mode;
+    uint32_t debug_key_col;
+    uint32_t debug_key_row;
 
     /* LCD */
     QemuConsole *con;
@@ -1859,6 +1863,14 @@ static void g9001_init(MachineState *machine)
     s->trace_io = gms->trace_io;
     s->trace_nand = gms->trace_nand;
     s->trace_nand_kernel = gms->trace_nand_kernel;
+    s->debug_key_col = gms->debug_key_col;
+    s->debug_key_row = gms->debug_key_row;
+    if (gms->debug_key_col < G9001_KEY_COLS &&
+        gms->debug_key_row < G9001_KEY_ROWS) {
+        s->key_state[gms->debug_key_col][gms->debug_key_row] = 1;
+        info_report("g9001: holding key at column %u row %u",
+                    gms->debug_key_col, gms->debug_key_row);
+    }
     s->trace_irq = gms->trace_irq;
     s->t16_hz = gms->t16_hz;
     s->debug_p1_low_mask = gms->debug_p1_low_mask;
@@ -2084,6 +2096,8 @@ static void g9001_machine_instance_init(Object *obj)
     gms->nand_cle_pin = 2;          /* P0.2 = CLE  */
     gms->nand_ale_pin = 3;          /* P0.3 = ALE  */
     gms->nand_ryby_pin = 4 * 8 + 0; /* P4.0 = RY/#BY */
+    gms->debug_key_col = 0xffffffff;
+    gms->debug_key_row = 0xffffffff;
     gms->nand_ecc_offset = G9001_NAND_RAW_PAGE - 8;
 
     object_property_add_str(obj, "nand-image",
@@ -2157,6 +2171,16 @@ static void g9001_machine_instance_init(Object *obj)
     object_property_set_description(obj, "debug-boot-mode",
                                     "Byte left at A0RAM 0x221 for the second "
                                     "stage (0x400d48 compares it with 1)");
+    object_property_add_uint32_ptr(obj, "debug-key-col",
+                                   &gms->debug_key_col,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "debug-key-col",
+                                    "Hold a key down: matrix column (0..7)");
+    object_property_add_uint32_ptr(obj, "debug-key-row",
+                                   &gms->debug_key_row,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "debug-key-row",
+                                    "Hold a key down: matrix row (0..7)");
     object_property_add_bool(obj, "nand-kernel-4k",
                              g9001_get_kernel_4k, g9001_set_kernel_4k);
     object_property_set_description(obj, "nand-kernel-4k",
