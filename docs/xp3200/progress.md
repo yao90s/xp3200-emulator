@@ -1318,7 +1318,7 @@ E08 保持完整 32 位（它的 SDRAM 在 `0x10000000`，固件把 trap 表装�
 | `translate.c` | `int` 向量、`ld/ld.w %ttbr`、`jr/jp %rN` 改用 `ctx->ttbr_mask` / `ctx->addr_mask` | 28 位 | 32 位 |
 | `cpu.c` | trap 入口（IRQ/NMI）的向量地址用同一掩码 | 28 位 | 32 位 |
 | `hw/s1c33/xp3200.c`、`bbk9288s.c` | TTBR 寄存器模型用 `S1C33_TTBR_MASK_L05` | 28 位 | — |
-| `hw/s1c33/g9001.c` | `object_property_set_uint(..., "core-variant", S1C33_CORE_E08)` | — | 32 位 |
+| `hw/s1c33/g9001.c` | `s1c33_cpu_create(machine->cpu_type, S1C33_CORE_E08, true)`（realize 前设属性） | — | 32 位 |
 
 另外两处是**两个核心都适用**的修复：
 

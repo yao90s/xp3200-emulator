@@ -10,13 +10,16 @@ xp3200-emulator/
 ├── hw/s1c33/
 │   ├── xp3200.c          XP3200 machine（本项目新增，主战场）
 │   ├── bbk9288s.c        9288 machine（上游遗留，保留）
-│   ├── Kconfig           注册 CONFIG_XP3200 / CONFIG_BBK9288S
+│   ├── g9001.c           SII G9001 研究机型（S1C33E08，实验性）
+│   ├── Kconfig           注册 CONFIG_XP3200 / CONFIG_BBK9288S / CONFIG_G9001
 │   ├── meson.build       编译入口
 │   ├── s1c33.c           S1C33 总线/中断等公共部分
 │   └── ...
 ├── target/s1c33/         S1C33 CPU 翻译（translate.c）、指令 helper、反汇编
+│                         CPU 的 `core-variant` 属性决定寻址宽度（L05 28 位 / E08 32 位）
 ├── docs/xp3200/          硬件连接、键盘映射、SD 卡工具、移植进度
-├── scripts/xp3200/       SD 卡镜像工具（GUI + CLI + FAT16 解析）
+├── scripts/xp3200/       SD 卡镜像工具（GUI + CLI + FAT16 解析）与冒烟测试
+├── scripts/g9001/        G9001 冒烟测试
 ├── include/hw/s1c33/     CPU/机器头文件
 └── （其余为 QEMU 11 原有目录）
 ```
