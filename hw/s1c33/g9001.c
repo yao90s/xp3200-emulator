@@ -636,6 +636,16 @@ static bool g9001_nand_load_page(G9001State *s, uint32_t row)
     /* "ECC always correct": expose the page's stored parity bytes. */
     memcpy(s->nand_ecc, n->page + n->page_size - sizeof(s->nand_ecc),
            sizeof(s->nand_ecc));
+    if (s->trace_nand) {
+        uint32_t c = n->col < n->page_size ? n->col : 0;
+
+        info_report("g9001-nand: page %u (row %u col %u) head="
+                    "%02x %02x %02x %02x %02x %02x %02x %02x",
+                    page, row, n->col,
+                    n->page[c + 0], n->page[c + 1], n->page[c + 2],
+                    n->page[c + 3], n->page[c + 4], n->page[c + 5],
+                    n->page[c + 6], n->page[c + 7]);
+    }
     return true;
 }
 
