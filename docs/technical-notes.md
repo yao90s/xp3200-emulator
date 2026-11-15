@@ -154,11 +154,13 @@ Implemented pieces:
   and returns with `RETI`.
 - Software interrupt (`INT imm`, opcode `04xx`) dispatches through
   `TTBR + 48 + (imm & 3) * 4` and **clears `PSR.IE`** on entry (manual behaviour).
-- Trap-table base and indirect jump targets are kept **full width**: the masks are
-  `0xfffffc00` (TTBR, 1 KiB aligned) and `0xfffffffe` (jr/jp, 2-byte aligned).
-  They used to drop bits 28-31, which is harmless for the L05 map but silently
-  truncated any address above `0x10000000` (the E08 puts its SDRAM at
-  `0x10000000` and the loaded OS at `0x11e8xxxx`).
+- Trap-table base and indirect jump targets are **core dependent**: the L05
+  keeps a 28-bit internal address bus (`TTBR` bits 31:28 read as zero), the
+  E08 keeps the full 32-bit address (its SDRAM sits at `0x10000000` and the
+  loaded OS at `0x11e8xxxx`).  Both are selected through the CPU's
+  `core-variant` property (`l05` by default, `e08` for `-M g9001`), so the
+  masks are `0x0ffffc00`/`0x0ffffffe` on the L05 and `0xfffffc00`/`0xfffffffe`
+  on the E08.
 - `ld.w %ttbr,%r12` (`0xA0C8`) is implemented; it used to stop the CPU as an
   unimplemented opcode.
 - LCDC/USB/SPI ITC delivery for USB factor flag: vector `113`, with USB

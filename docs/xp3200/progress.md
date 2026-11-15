@@ -1303,40 +1303,45 @@ ffmpeg 可完整解码出 26 秒音频；换成默认缓冲后播放平滑。
 
 ---
 
-## 2026-11 更新：与 G9001 共用 CPU 代码的变更
+## 2026-11 更新：与 G9001 共用 CPU 代码（按核心型号配置）
 
-移植 G9001（Epson S1C33E08）时在**共用**的 `target/s1c33` 里改了 5 处，
-这里记录它们对 XP3200（S1C33L05）的影响，便于以后对照。
+G9001 用的是 S1C33**E08**，XP3200/9288 用 S1C33**L05**。两者的差别不是“谁对谁错”，
+而是**寻址宽度**不同：L05 是 28 位内部地址总线、TTBR 的 bit31:28 固定 0（手册 II-5-5）；
+E08 保持完整 32 位（它的 SDRAM 在 `0x10000000`，固件把 trap 表装在 `0x11e84000`）。
 
-| 位置 | 改动 | 对 XP3200 的影响 |
-|---|---|---|
-| `cpu.h` | `S1C33_TTBR_MASK` `0x0ffffc00` → `0xfffffc00` | XP3200 的 trap 表基址是 `0x02000000`，bit28 及以上恒为 0，**恒等变换** |
-| `translate.c` | 间接跳转/调用掩码 `0x0ffffffe` → `0xfffffffe` | XP3200 的地址空间（IRAM 0、IO 0x40000、板级 IO 0x01000000、SDRAM 0x02000000、NOR 0x00C00000、NAND 0x04000000）**全部 < 0x10000000**，恒等变换 |
-| `translate.c` | `int` 进入时清 `PSR.IE`（原来错误地置位） | 按手册修正；若固件用 `int` 做系统调用，语义更正确 |
-| `translate.c` | 实现 `ld.w %ttbr,%r12`（0xA0C8，之前 unimplemented → 关机） | 纯改进 |
-| `helper.c/h` | 调用日志加 `r10–r15`、软中断向量追踪 | 仅 trace 时输出，不影响执行 |
+所以这些差异不再写死在 `target/s1c33` 的全局宏里，而是由 CPU 的 `core-variant`
+属性选择（默认 `l05`，行为与改动前完全一致；`-cpu c33l05,core-variant=1` 可显式开 E08）：
 
-另有 `cpu.c/h` 的 `slp-as-nop` 机器属性，**默认关**，默认行为不变。
+| 位置 | 改动 | L05（默认） | E08 |
+|---|---|---|---|
+| `cpu.h` | `S1C33_TTBR_MASK_L05/_E08`、`S1C33_ADDR_MASK_L05/_E08` + `s1c33_ttbr_mask()/s1c33_addr_mask()` | 28 位 | 32 位 |
+| `translate.c` | `int` 向量、`ld/ld.w %ttbr`、`jr/jp %rN` 改用 `ctx->ttbr_mask` / `ctx->addr_mask` | 28 位 | 32 位 |
+| `cpu.c` | trap 入口（IRQ/NMI）的向量地址用同一掩码 | 28 位 | 32 位 |
+| `hw/s1c33/xp3200.c`、`bbk9288s.c` | TTBR 寄存器模型用 `S1C33_TTBR_MASK_L05` | 28 位 | — |
+| `hw/s1c33/g9001.c` | `object_property_set_uint(..., "core-variant", S1C33_CORE_E08)` | — | 32 位 |
 
-### 冒烟验证（改动后的构建跑 XP3200）
+另外两处是**两个核心都适用**的修复：
 
-```bash
-cd _build
-./qemu-system-s1c33 \
-  -M 'xp3200,debug-lcd-dump-ms=8000,debug-lcd-dump-path=/tmp/xp_nor.pgm' \
-  -bios ../../../out/NOR_unique_1MB.bin \
-  -cpu c33l05,exit-on-halt=off -display none -serial none -monitor none
-```
+- `int` 进入时**清** `PSR.IE`（原来错误地置位；L05 手册 II-5-3 trap 处理第 (2) 步就是
+  `PSR.IE←0`，硬件中断路径本来也是清）；
+- 实现 `ld.w %ttbr,%r12`（0xA0C8，之前 unimplemented → 关机），并把 0xA0xx 特殊寄存器
+  解码范围放宽到 `0xA0FF`。
 
-结果：320×240 正常出图（2984 个暗像素）：
+`slp-as-nop` 仍是机器属性（默认关）：G9001 固件把 `slp` 当“等时钟稳定”的短延时用，
+模型里没有东西能唤醒它，所以 `-M g9001` 会打开；XP3200/9288 不受影响。
 
-```
-===龙腾操作系统V1.1===
-华普电子版权所有
-初始化系统…未找到启动文件
-请拷贝启动文件到U盘根目录中
-U盘连接中…
-```
+### 回归验证（2026-11-15）
 
-截图见工作区 `SII_G9100/PRJ/docs/emu/xp3200_after_g9001.png`。
+用 `nand_oob_formatted.img` + 原机 NOR 跑完整引导：
+
+- `scripts/xp3200/smoke.sh`：开机 → 主菜单 → `Enter` 进「朗文双解」→ `Esc` 返回；
+  30 s 与 45 s 两帧**逐字节相同**（画面稳定、看门狗没有复位），`Enter` 后画面显著变化，
+  `Esc` 回到菜单；
+- 与线上 `origin/main`（`5c3b2a0`）构建做 A/B（同镜像、同按键序列）：30 s/45 s 主菜单、
+  `Esc` 后三帧 **0/76800 像素差**；词典页只差 16 px（搜索框 1px 宽光标的闪烁相位）；
+- NES（SD 卡 → 下载游戏 → MARIO）可进 World 1-1，手柄 `$06FC` 实测
+  `Right=0x01`、`Down=0x04`、`M(=A)=0x80`；
+- G9001：`scripts/g9001/smoke.sh` 通过（引导配置数据、`0x11e841b0` OS 入口被执行、
+  640×480 4bpp/16 级灰阶）；完整 13 项在 G9001 工作区 `tools/emu/selftest.sh` 全绿。
+
 `-M help` 中 5 台机器均正常：`bbk9288`、`bbk9288s`、`g9001`、`xp3200`、`xp3200s`。

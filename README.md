@@ -1,4 +1,4 @@
-﻿# 快易典 XP3200 QEMU 模拟器
+# 快易典 XP3200 QEMU 模拟器
 
 这是基于 QEMU 11 实现的快易典 XP3200 硬件模拟器，模拟 Epson S1C33L05
 处理器、`320 × 240` 屏幕、5 行 × 14 列键盘、NAND/NOR、SD 卡、VS1003
@@ -162,13 +162,35 @@ bash scripts/xp3200/sd_image.sh create ~/card.img 128 "SD CARD" ~/音乐 ~/电�
 源码组织与阅读顺序见 [源码结构与阅读指南](docs/xp3200/source-guide.md)；
 更完整的调试记录与逆向过程见 [移植进度](docs/xp3200/progress.md)。
 
+## 机型
+
+| `-M` | CPU 核 | 说明 |
+|---|---|---|
+| `xp3200` | S1C33L05 | 本仓库主体：320×240、5×14 键盘、NOR+NAND、SD、VS1003 |
+| `xp3200s` | S1C33L05 | XP3200 开发机型（同一板级模型） |
+| `bbk9288`、`bbk9288s` | S1C33L05 | 上游 bbk9288-emulator 的机型 |
+| `g9001` | S1C33E08 | **研究机型**：精工 SII G9001 日文词典，640×480 单色 TFT |
+
+`g9001` 与 XP3200 共用同一份 `target/s1c33` CPU 核，但两个核心的寻址宽度不同：
+L05 是 28 位内部地址总线、TTBR bit31:28 固定 0；E08 保持完整 32 位（SDRAM 在
+`0x10000000` 以上）。差异由 CPU 的 `core-variant` 属性选择（默认 `l05`），
+`-M g9001` 会选 `e08`，所以两边互不影响。
+
+改过 `target/s1c33` 后请同时跑两个冒烟脚本（需要自备镜像）：
+
+```bash
+NAND=nand.img NOR=nor.bin bash scripts/xp3200/smoke.sh   # 主菜单/词典/返回
+NAND=g9001-nand.bin    bash scripts/g9001/smoke.sh      # 引导 + E08 OS 入口 + LCD
+```
+
 ## 代码结构
 
 - `hw/s1c33/`：S1C33 板级设备；`xp3200.c` 为 XP3200 machine（LCD、NAND、NOR、
-  键盘、SD、音频、定时器等）。
-- `target/s1c33/`：Epson S1C33 CPU 翻译、指令 helper 和反汇编。
+  键盘、SD、音频、定时器等），`g9001.c` 为 G9001 研究机型。
+- `target/s1c33/`：Epson S1C33 CPU 翻译、指令 helper 和反汇编；`core-variant`
+  在这里按型号选择寻址宽度。
 - `docs/xp3200/`：硬件连接、键盘映射、源码阅读指南、SD 卡工具说明、移植进度与技术笔记。
-- `scripts/xp3200/`：SD 卡镜像工具。
+- `scripts/xp3200/`：SD 卡镜像工具与冒烟测试；`scripts/g9001/`：G9001 冒烟测试。
 
 ## 资料依据
 
