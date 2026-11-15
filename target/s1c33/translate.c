@@ -594,6 +594,7 @@ static void gen_software_interrupt(DisasContext *ctx, uint16_t word)
      */
     tcg_gen_andi_i32(cpu_psr, cpu_psr, ~S1C33_PSR_IE);
     gen_clear_ext(ctx);
+    gen_helper_s1c33_int_trace(tcg_env, vector_addr, target);
     tcg_gen_mov_i32(cpu_pc, target);
     tcg_gen_lookup_and_goto_ptr();
     ctx->base.is_jmp = DISAS_NORETURN;
