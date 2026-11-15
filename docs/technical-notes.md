@@ -152,6 +152,15 @@ Implemented pieces:
 - S1C33 maskable interrupt entry/return: IRQ acceptance honors `PSR.IE` and
   `PSR.IL`, pushes return PC and PSR, dispatches through `TTBR + vector * 4`,
   and returns with `RETI`.
+- Software interrupt (`INT imm`, opcode `04xx`) dispatches through
+  `TTBR + 48 + (imm & 3) * 4` and **clears `PSR.IE`** on entry (manual behaviour).
+- Trap-table base and indirect jump targets are kept **full width**: the masks are
+  `0xfffffc00` (TTBR, 1 KiB aligned) and `0xfffffffe` (jr/jp, 2-byte aligned).
+  They used to drop bits 28-31, which is harmless for the L05 map but silently
+  truncated any address above `0x10000000` (the E08 puts its SDRAM at
+  `0x10000000` and the loaded OS at `0x11e8xxxx`).
+- `ld.w %ttbr,%r12` (`0xA0C8`) is implemented; it used to stop the CPU as an
+  unimplemented opcode.
 - LCDC/USB/SPI ITC delivery for USB factor flag: vector `113`, with USB
   priority level read from `0x402A3`.
 - Board USB/VBUS presence at `0x01000022` bit 7. The `usb-connected` machine

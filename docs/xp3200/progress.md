@@ -1300,3 +1300,43 @@ ffmpeg 可完整解码出 26 秒音频；换成默认缓冲后播放平滑。
 
 注意：该行为默认开启，与真机一致；若要在模拟器里“绕过”看门狗做长时间调试，
 可以让 guest 程序自己喂狗，或后续再加一个 `debug-watchdog=off` 机型属性。
+
+---
+
+## 2026-11 更新：与 G9001 共用 CPU 代码的变更
+
+移植 G9001（Epson S1C33E08）时在**共用**的 `target/s1c33` 里改了 5 处，
+这里记录它们对 XP3200（S1C33L05）的影响，便于以后对照。
+
+| 位置 | 改动 | 对 XP3200 的影响 |
+|---|---|---|
+| `cpu.h` | `S1C33_TTBR_MASK` `0x0ffffc00` → `0xfffffc00` | XP3200 的 trap 表基址是 `0x02000000`，bit28 及以上恒为 0，**恒等变换** |
+| `translate.c` | 间接跳转/调用掩码 `0x0ffffffe` → `0xfffffffe` | XP3200 的地址空间（IRAM 0、IO 0x40000、板级 IO 0x01000000、SDRAM 0x02000000、NOR 0x00C00000、NAND 0x04000000）**全部 < 0x10000000**，恒等变换 |
+| `translate.c` | `int` 进入时清 `PSR.IE`（原来错误地置位） | 按手册修正；若固件用 `int` 做系统调用，语义更正确 |
+| `translate.c` | 实现 `ld.w %ttbr,%r12`（0xA0C8，之前 unimplemented → 关机） | 纯改进 |
+| `helper.c/h` | 调用日志加 `r10–r15`、软中断向量追踪 | 仅 trace 时输出，不影响执行 |
+
+另有 `cpu.c/h` 的 `slp-as-nop` 机器属性，**默认关**，默认行为不变。
+
+### 冒烟验证（改动后的构建跑 XP3200）
+
+```bash
+cd _build
+./qemu-system-s1c33 \
+  -M 'xp3200,debug-lcd-dump-ms=8000,debug-lcd-dump-path=/tmp/xp_nor.pgm' \
+  -bios ../../../out/NOR_unique_1MB.bin \
+  -cpu c33l05,exit-on-halt=off -display none -serial none -monitor none
+```
+
+结果：320×240 正常出图（2984 个暗像素）：
+
+```
+===龙腾操作系统V1.1===
+华普电子版权所有
+初始化系统…未找到启动文件
+请拷贝启动文件到U盘根目录中
+U盘连接中…
+```
+
+截图见工作区 `SII_G9100/PRJ/docs/emu/xp3200_after_g9001.png`。
+`-M help` 中 5 台机器均正常：`bbk9288`、`bbk9288s`、`g9001`、`xp3200`、`xp3200s`。
