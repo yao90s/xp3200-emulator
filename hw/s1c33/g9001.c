@@ -246,6 +246,7 @@ typedef struct G9001Nand {
     bool ignore_ecc;                /* report a blank (all-FF) spare */
     bool spare_real;                /* direct spare reads bypass ignore_ecc */
     bool program_loaded;
+    bool spare_stream;              /* col >= data_size stays in the stream */
     GHashTable *written;            /* page -> programmed bytes (RAM overlay) */
 
     /*
@@ -301,6 +302,7 @@ typedef struct G9001MachineState {
     bool nand_kernel_4k;
     bool nand_ignore_ecc;
     bool nand_spare_real;
+    bool nand_spare_stream;
     bool slp_as_nop;                /* treat SLP as NOP (default on) */
 } G9001MachineState;
 
@@ -826,6 +828,17 @@ static unsigned g9001_nand_stream_offset(const G9001Nand *n, unsigned pos)
 }
 
 /*
+ * Whether the current column addresses the raw spare area directly (col >=
+ * page data size) or stays inside the interleaved 512+8 stream.  Which of the
+ * two the card really does decides what a firmware "read at column 2048" sees,
+ * so it is switchable.
+ */
+static bool g9001_nand_raw_col(G9001State *s)
+{
+    return !s->nand.spare_stream && s->nand.col >= s->nand.data_size;
+}
+
+/*
  * Feed one byte into the NAND command/address/data state machine.
  * `command` is true when the CLE line is asserted, `address` when ALE is.
  */
@@ -852,7 +865,7 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
             g9001_nand_latch_addr(s);
             g9001_nand_load_page(s, n->row);
             n->data_ptr = n->col;
-        n->raw_stream = n->col >= n->data_size;
+        n->raw_stream = g9001_nand_raw_col(s);
             n->data_end = g9001_nand_stream_size(n);
             n->phase = G9001_NAND_READ;
             break;
@@ -864,7 +877,7 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
             g9001_nand_latch_addr(s);
             g9001_nand_load_page(s, n->row);
             n->data_ptr = n->col;
-        n->raw_stream = n->col >= n->data_size;
+        n->raw_stream = g9001_nand_raw_col(s);
             n->data_end = g9001_nand_stream_size(n);
             n->phase = G9001_NAND_STATUS;
             break;
@@ -910,7 +923,7 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
             }
             n->addr_count = 0;
             n->data_ptr = n->col;
-            n->raw_stream = n->col >= n->data_size;
+            n->raw_stream = g9001_nand_raw_col(s);
             n->data_end = g9001_nand_stream_size(n);
             n->phase = G9001_NAND_READ;
             break;
@@ -941,7 +954,7 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
             if (n->addr_count >= 3) {
                 g9001_nand_latch_addr(s);
                 n->data_ptr = n->col;
-        n->raw_stream = n->col >= n->data_size;
+        n->raw_stream = g9001_nand_raw_col(s);
                 g9001_nand_load_page(s, n->row);
             }
             if (n->raw_stream) {
@@ -976,7 +989,7 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
         g9001_nand_latch_addr(s);
         g9001_nand_load_page(s, n->row);
         n->data_ptr = n->col;
-        n->raw_stream = n->col >= n->data_size;
+        n->raw_stream = g9001_nand_raw_col(s);
         n->data_end = g9001_nand_stream_size(n);
         if (n->phase == G9001_NAND_IDLE) {
             n->phase = G9001_NAND_READ;
@@ -2658,6 +2671,7 @@ static void g9001_init(MachineState *machine)
     s->nand_ecc_offset = gms->nand_ecc_offset;
     s->nand.ignore_ecc = gms->nand_ignore_ecc;
     s->nand.spare_real = gms->nand_spare_real;
+    s->nand.spare_stream = gms->nand_spare_stream;
     if (gms->nand_bad_blocks != NULL) {
         const char *p = gms->nand_bad_blocks;
 
@@ -2955,6 +2969,16 @@ static void g9001_set_nand_spare_real(Object *obj, bool value, Error **errp)
     G9001_MACHINE(obj)->nand_spare_real = value;
 }
 
+static bool g9001_get_nand_spare_stream(Object *obj, Error **errp)
+{
+    return G9001_MACHINE(obj)->nand_spare_stream;
+}
+
+static void g9001_set_nand_spare_stream(Object *obj, bool value, Error **errp)
+{
+    G9001_MACHINE(obj)->nand_spare_stream = value;
+}
+
 static char *g9001_get_nand_bad_blocks(Object *obj, Error **errp)
 {
     return g_strdup(G9001_MACHINE(obj)->nand_bad_blocks);
@@ -3196,6 +3220,13 @@ static void g9001_machine_instance_init(Object *obj)
                                     "ECC bytes but return the stored spare "
                                     "bytes when the firmware reads the spare "
                                     "area directly (column >= page data size)");
+    object_property_add_bool(obj, "nand-spare-stream",
+                             g9001_get_nand_spare_stream,
+                             g9001_set_nand_spare_stream);
+    object_property_set_description(obj, "nand-spare-stream",
+                                    "Treat every column, including >= page data "
+                                    "size, as a position in the interleaved "
+                                    "512+8 stream instead of the raw spare area");
     object_property_add_str(obj, "nand-bad-blocks",
                             g9001_get_nand_bad_blocks,
                             g9001_set_nand_bad_blocks);
