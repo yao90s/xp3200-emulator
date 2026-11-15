@@ -64,6 +64,7 @@ struct ArchCPU {
 
     bool exit_on_halt;
     bool shutdown_on_disabled_halt;
+    bool slp_as_nop;
     bool trace_psr;
     bool trace_calls;
     bool trace_exec;

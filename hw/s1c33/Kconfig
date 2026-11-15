@@ -9,3 +9,8 @@ config XP3200
     bool
     default y
     depends on S1C33
+
+config G9001
+    bool
+    default y
+    depends on S1C33

@@ -23,6 +23,7 @@ typedef struct DisasContext {
     uint32_t pc;
     uint16_t ext[2];
     unsigned ext_count;
+    bool slp_as_nop;
 } DisasContext;
 
 enum {
@@ -90,6 +91,9 @@ static TCGv_i32 s1c33_special_reg(unsigned reg)
         return cpu_alr;
     case 3:
         return cpu_ahr;
+    case 8:
+        /* TTBR: trap table base, bits 9..0 read back as zero. */
+        return cpu_ttbr;
     default:
         return NULL;
     }
@@ -718,6 +722,9 @@ static void gen_ld_reg_to_special(DisasContext *ctx, uint16_t word)
                                    tcg_constant_i32(word));
     } else {
         tcg_gen_mov_i32(dst, cpu_regs[rs]);
+        if (sd == 8) {
+            tcg_gen_andi_i32(cpu_ttbr, cpu_ttbr, S1C33_TTBR_MASK);
+        }
     }
     gen_clear_ext(ctx);
 }
@@ -1372,6 +1379,15 @@ static void translate_one(DisasContext *ctx, uint16_t word)
         gen_retd(ctx);
         return;
     case 0x0040:
+        /*
+         * SLP stops the CPU clock until an interrupt.  Board firmware that
+         * uses it as a short "wait for the clock unit" delay cannot be woken
+         * in the emulator (no interrupt is pending and PSR.IE may be clear),
+         * so machines that know this can ask for SLP to behave as a NOP.
+         */
+        if (ctx->slp_as_nop) {
+            return;
+        }
         tcg_gen_movi_i32(cpu_pc, ctx->base.pc_next);
         gen_helper_s1c33_sleep(tcg_env, tcg_constant_i32(ctx->pc));
         ctx->base.is_jmp = DISAS_NORETURN;
@@ -1542,7 +1558,7 @@ static void translate_one(DisasContext *ctx, uint16_t word)
         gen_not_imm(ctx, word);
         return;
     }
-    if (word >= 0xa000 && word <= 0xa0f3 && (word & 0xc) == 0) {
+    if (word >= 0xa000 && word <= 0xa0ff) {
         gen_ld_reg_to_special(ctx, word);
         return;
     }
@@ -1623,6 +1639,7 @@ void s1c33_translate_code(CPUState *cs, TranslationBlock *tb,
 {
     DisasContext dc = { };
 
+    dc.slp_as_nop = S1C33_CPU(cs)->slp_as_nop;
     translator_loop(cs, tb, max_insns, pc, host_pc, &s1c33_tr_ops, &dc.base);
 }
 
