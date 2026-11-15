@@ -657,7 +657,12 @@ static void gen_register_call_or_jump(DisasContext *ctx, uint16_t word,
     uint16_t delay_word;
     TCGv_i32 target = tcg_temp_new_i32();
 
-    tcg_gen_andi_i32(target, cpu_regs[rb], 0x0ffffffe);
+    /*
+     * Only align the target: the E08 maps SDRAM up to 0x12000000, so a
+     * 28-bit mask here would silently truncate every indirect jump into
+     * the loaded OS.
+     */
+    tcg_gen_andi_i32(target, cpu_regs[rb], 0xfffffffeu);
     gen_clear_ext(ctx);
 
     if (call) {
