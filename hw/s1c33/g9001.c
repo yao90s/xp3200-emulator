@@ -286,6 +286,7 @@ typedef struct G9001MachineState {
     uint32_t nand_ecc_offset;
     bool nand_kernel_4k;
     bool nand_ignore_ecc;
+    bool slp_as_nop;                /* treat SLP as NOP (default on) */
 } G9001MachineState;
 
 typedef struct G9001T16 {
@@ -2592,12 +2593,13 @@ static void g9001_init(MachineState *machine)
     /*
      * core-variant = E08 keeps the full 32-bit trap-table/jump address (its
      * SDRAM sits above 0x10000000), unlike the L05's 28-bit internal bus.
-     * slp-as-nop: the boot loader and the OS use SLP as a short "clock unit
-     * settled" delay while PSR.IE is clear, so nothing could ever wake the
-     * CPU in the model.  Both are forced on for this machine; the -cpu
-     * properties cannot override them because the CPU is realized here.
+     * slp-as-nop is a machine property (default on): the boot loader and the
+     * OS use SLP as a short "clock unit settled" delay while PSR.IE is clear,
+     * so nothing could ever wake the CPU in the model.  Turn it off with
+     * -M g9001,slp-as-nop=off to model the real wait.
      */
-    cpu = S1C33_CPU(s1c33_cpu_create(machine->cpu_type, S1C33_CORE_E08, true));
+    cpu = S1C33_CPU(s1c33_cpu_create(machine->cpu_type, S1C33_CORE_E08,
+                                     gms->slp_as_nop));
     s->cpu = cpu;
     s->cpu->env.sp = G9001_BOOT_STACK_TOP;
     s->cpu->env.ttbr = 0;
@@ -2780,6 +2782,16 @@ static void g9001_set_nand_ignore_ecc(Object *obj, bool value, Error **errp)
     G9001_MACHINE(obj)->nand_ignore_ecc = value;
 }
 
+static bool g9001_get_slp_as_nop(Object *obj, Error **errp)
+{
+    return G9001_MACHINE(obj)->slp_as_nop;
+}
+
+static void g9001_set_slp_as_nop(Object *obj, bool value, Error **errp)
+{
+    G9001_MACHINE(obj)->slp_as_nop = value;
+}
+
 static bool g9001_get_kernel_4k(Object *obj, Error **errp)
 {
     return G9001_MACHINE(obj)->nand_kernel_4k;
@@ -2823,6 +2835,7 @@ static void g9001_machine_instance_init(Object *obj)
     gms->debug_gpio_low_port = 0xffffffff;
     gms->mmc_capacity_mb = 128;
     gms->nand_ignore_ecc = true;
+    gms->slp_as_nop = true;
     gms->debug_dump_addr = 0x10000000;
     gms->debug_dump_ms = 1000;
     gms->debug_gpio_low_mask = 0;
@@ -2980,6 +2993,13 @@ static void g9001_machine_instance_init(Object *obj)
     object_property_set_description(obj, "nand-kernel-4k",
                                     "Switch the NAND geometry to 4 KiB pages "
                                     "when the kernel programs pCARDSETUP");
+    object_property_add_bool(obj, "slp-as-nop",
+                             g9001_get_slp_as_nop, g9001_set_slp_as_nop);
+    object_property_set_description(obj, "slp-as-nop",
+                                    "Treat SLP as a NOP (default on): the "
+                                    "firmware uses it as a clock-settling "
+                                    "delay with PSR.IE clear, so nothing could "
+                                    "wake the CPU in the model");
     object_property_add_bool(obj, "debug-force-event",
                              g9001_get_force_event,
                              g9001_set_force_event);
