@@ -89,6 +89,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(G9001MachineState, G9001_MACHINE)
 #define G9001_IO_ECC_ENA        0x000312
 #define G9001_IO_ECC_MD         0x000313
 #define G9001_IO_ECC0_BASE      0x000314   /* ECC0CP..ECC1LPH, 8 bytes */
+#define G9001_IO_USB_CTL        0x000921   /* USB_Control */
 #define G9001_IO_SDRAMC_INI     0x001600
 #define G9001_SDRAMC_INI_READY  0x18       /* init done + ready */
 #define G9001_IO_SDRAMC_CTL     0x001604
@@ -239,6 +240,8 @@ typedef struct G9001MachineState {
     bool trace_nand;
     bool trace_irq;
     uint32_t t16_hz;
+    uint32_t debug_p1_low_mask;     /* force P1 input bits low */
+    uint32_t debug_usbctl;          /* 0=as written, 1=bit7 set, 2=bit7 clear */
     uint32_t nand_cle_pin;          /* port * 8 + bit, 0xffffffff = not wired */
     uint32_t nand_ale_pin;
     uint32_t nand_ryby_pin;
@@ -263,6 +266,8 @@ typedef struct G9001State {
     bool trace_io;
     bool trace_nand;
     bool trace_irq;
+    uint32_t debug_p1_low_mask;
+    uint32_t debug_usbctl;
 
     /* LCD */
     QemuConsole *con;
@@ -1066,11 +1071,12 @@ static void g9001_pc_sample_cb(void *opaque)
     G9001MachineState *gms = G9001_MACHINE(s->machine);
 
     info_report("g9001-pc: pc=0x%08x sp=0x%08x psr=0x%08x ttbr=0x%08x "
-                "lcd_ps=0x%02x madd=0x%08x t16(ctl=0x%02x cnt=%u ca=%u cb=%u "
-                "ie=0x%02x il=0x%02x fl=0x%02x)",
+                "lcd_ps=0x%02x madd=0x%08x disp=0x%08x t16(ctl=0x%02x "
+                "cnt=%u ca=%u cb=%u ie=0x%02x il=0x%02x fl=0x%02x)",
                 g9001_current_pc(), s->cpu->env.sp, s->cpu->env.psr,
                 s->cpu->env.ttbr, s->io[G9001_IO_LCDC_PS],
                 g9001_lcdc32(s, G9001_IO_LCDC_MADD),
+                s->a0ram_ptr != NULL ? ldl_le_p(s->a0ram_ptr + 0x678) : 0,
                 s->t16.ctl, s->t16.counter, s->t16.ca, s->t16.cb,
                 s->io[G9001_IO_INT_E16T01], s->io[0x0266],
                 s->io[0x0282]);
@@ -1188,6 +1194,9 @@ static uint8_t g9001_port_pins(G9001State *s, unsigned port)
         } else {
             in |= (1u << (byby % 8));
         }
+    }
+    if (port == 1 && s->debug_p1_low_mask != 0) {
+        in &= ~(s->debug_p1_low_mask & 0xff);
     }
     return out | (in & ~dir);
 }
@@ -1332,6 +1341,14 @@ static uint64_t g9001_io_read(void *opaque, hwaddr offset, unsigned size)
 
             v = (rel & 1) ? g9001_port_dir(s, port) :
                             g9001_port_pins(s, port);
+        } else if (off == G9001_IO_USB_CTL) {
+            /* USB_Control: bit7 is polled by the boot code (0x400d60). */
+            v = s->io[off];
+            if (s->debug_usbctl == 1) {
+                v |= 0x80;
+            } else if (s->debug_usbctl == 2) {
+                v &= 0x7f;
+            }
         } else if (off == G9001_IO_SPI_STAT) {
             v = 0x02;           /* Tx empty: card transfers never block */
         } else if (off == G9001_IO_SPI_RXD) {
@@ -1649,6 +1666,8 @@ static void g9001_init(MachineState *machine)
     s->trace_nand = gms->trace_nand;
     s->trace_irq = gms->trace_irq;
     s->t16_hz = gms->t16_hz;
+    s->debug_p1_low_mask = gms->debug_p1_low_mask;
+    s->debug_usbctl = gms->debug_usbctl;
     s->nand_ecc_offset = gms->nand_ecc_offset;
 
     memory_region_init_ram(&s->a0ram, NULL, "g9001.a0ram",
@@ -1875,6 +1894,17 @@ static void g9001_machine_instance_init(Object *obj)
     object_property_set_description(obj, "t16-hz",
                                     "16-bit timer 0 input clock in Hz "
                                     "(default 32768, the OSC1 rate)");
+    object_property_add_uint32_ptr(obj, "debug-p1-low-mask",
+                                   &gms->debug_p1_low_mask,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "debug-p1-low-mask",
+                                    "Force selected P1 input bits low "
+                                    "(e.g. 4 = P1.2, a boot-time GPIO test)");
+    object_property_add_uint32_ptr(obj, "debug-usbctl", &gms->debug_usbctl,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "debug-usbctl",
+                                    "Override USB_Control (0x300921) bit7: "
+                                    "0 = as written, 1 = set, 2 = clear");
     object_property_add_uint32_ptr(obj, "nand-cle-pin", &gms->nand_cle_pin,
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_set_description(obj, "nand-cle-pin",
