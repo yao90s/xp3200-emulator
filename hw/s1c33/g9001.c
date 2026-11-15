@@ -64,8 +64,15 @@ OBJECT_DECLARE_SIMPLE_TYPE(G9001MachineState, G9001_MACHINE)
 #define G9001_CARD4_SIZE        (1 * MiB)
 #define G9001_CARD14_BASE       0x03000000u
 #define G9001_CARD14_SIZE       (16 * MiB)
+/* Area 11/12 are the other selectable #CE11 card windows; map Area 11 too so
+ * firmware that re-points CARDSETUP still reaches the flash. */
+#define G9001_CARD11_BASE       0x01000000u
+#define G9001_CARD11_SIZE       (8 * MiB)
 #define G9001_AREA7_BASE        0x00400000u
 #define G9001_AREA7_SIZE        (2 * MiB)
+/* Loader globals in the Area 7 alias: boot phase and event flag. */
+#define G9001_FLAG_PHASE        0x004040f8u
+#define G9001_FLAG_EVENT        0x004040fcu
 #define G9001_IO_BASE           0x00300000u
 #define G9001_IO_SIZE           0x00004000u
 #define G9001_SDRAM_BASE        0x10000000u
@@ -243,6 +250,8 @@ typedef struct G9001MachineState {
     uint32_t debug_p1_low_mask;     /* force P1 input bits low */
     uint32_t debug_usbctl;          /* 0=as written, 1=bit7 set, 2=bit7 clear */
     uint32_t debug_boot_mode;       /* value left at A0RAM 0x221 */
+    bool debug_force_event;
+    bool debug_lcd_test;
     uint32_t nand_cle_pin;          /* port * 8 + bit, 0xffffffff = not wired */
     uint32_t nand_ale_pin;
     uint32_t nand_ryby_pin;
@@ -303,6 +312,8 @@ typedef struct G9001State {
     unsigned trace_head;
     unsigned trace_count;
     bool trace_nand_window_seen;
+    uint64_t card_reads;
+    uint64_t card_writes;
 
     /* machine */
     MachineState *machine;
@@ -314,6 +325,7 @@ typedef struct G9001State {
     MemoryRegion io_region;
     MemoryRegion card4;
     MemoryRegion card14;
+    MemoryRegion card11;
     MemoryRegion sdram_alias;
     uint8_t *a0ram_ptr;
     uint8_t *ivram_ptr;
@@ -329,6 +341,7 @@ static G9001State *g9001_active = NULL;
 static uint8_t g9001_port_data(G9001State *s, unsigned port);
 static uint8_t g9001_port_dir(G9001State *s, unsigned port);
 static uint8_t g9001_port_pins(G9001State *s, unsigned port);
+static void g9001_lcd_paint_test(G9001State *s);
 
 /* ------------------------------------------------------------------------- */
 /* helpers                                                                   */
@@ -778,6 +791,7 @@ static uint64_t g9001_card_read(void *opaque, hwaddr offset, unsigned size)
         g9001_nand_byte(s, cle, ale, false, &v);
         ret |= (uint64_t)v << (8 * i);
     }
+    s->card_reads++;
     return ret;
 }
 
@@ -804,6 +818,7 @@ static void g9001_card_write(void *opaque, hwaddr offset, uint64_t value,
 
         g9001_nand_byte(s, cle, ale, true, &v);
     }
+    s->card_writes++;
 }
 
 static const MemoryRegionOps g9001_card_ops = {
@@ -1064,6 +1079,9 @@ static void g9001_lcd_dump_cb(void *opaque)
     G9001State *s = opaque;
     G9001MachineState *gms = G9001_MACHINE(s->machine);
 
+    if (gms->debug_lcd_test) {
+        g9001_lcd_paint_test(s);
+    }
     g9001_lcd_dump_pgm(s, gms->debug_lcd_dump_path);
 }
 
@@ -1072,9 +1090,23 @@ static void g9001_pc_sample_cb(void *opaque)
     G9001State *s = opaque;
     G9001MachineState *gms = G9001_MACHINE(s->machine);
 
+    /*
+     * Diagnostic: the loader clears [0x4040FC] and spins on `halt` until it
+     * becomes non-zero (0x400df4/0x400dfe).  Nothing in the loaded image ever
+     * sets it, so optionally fake the event to see what the rest of the boot
+     * would do.
+     */
+    if (gms->debug_force_event && s->sdram_ptr != NULL) {
+        uint32_t pc = g9001_current_pc();
+
+        if (pc >= 0x400df4 && pc <= 0x400dfe) {
+            info_report("g9001-dbg: idle wait reached (event flag kept set)");
+        }
+    }
+
     info_report("g9001-pc: pc=0x%08x sp=0x%08x psr=0x%08x ttbr=0x%08x "
                 "lcd_ps=0x%02x madd=0x%08x disp=0x%08x a0221=0x%02x "
-                "a03f3=0x%02x t16(ctl=0x%02x "
+                "a03f3=0x%02x card=%" PRIu64 "/%" PRIu64 " t16(ctl=0x%02x "
                 "cnt=%u ca=%u cb=%u ie=0x%02x il=0x%02x fl=0x%02x)",
                 g9001_current_pc(), s->cpu->env.sp, s->cpu->env.psr,
                 s->cpu->env.ttbr, s->io[G9001_IO_LCDC_PS],
@@ -1082,6 +1114,7 @@ static void g9001_pc_sample_cb(void *opaque)
                 s->a0ram_ptr != NULL ? ldl_le_p(s->a0ram_ptr + 0x678) : 0,
                 s->a0ram_ptr != NULL ? s->a0ram_ptr[0x221] : 0,
                 s->a0ram_ptr != NULL ? s->a0ram_ptr[0x3f3] : 0,
+                s->card_reads, s->card_writes,
                 s->t16.ctl, s->t16.counter, s->t16.ca, s->t16.cb,
                 s->io[G9001_IO_INT_E16T01], s->io[0x0266],
                 s->io[0x0282]);
@@ -1318,8 +1351,18 @@ static void g9001_t16_advance(G9001State *s)
 static void g9001_t16_cb(void *opaque)
 {
     G9001State *s = opaque;
+    G9001MachineState *gms = G9001_MACHINE(s->machine);
 
     g9001_t16_advance(s);
+    /*
+     * Diagnostic: keep the loader's idle event flag raised so its
+     * `while (!event) halt;` loop never blocks, and we can see what the rest
+     * of the boot does.
+     */
+    if (gms->debug_force_event && s->sdram_ptr != NULL) {
+        s->sdram_ptr[G9001_FLAG_EVENT - G9001_AREA7_BASE] = 1;
+        s->sdram_ptr[G9001_FLAG_PHASE - G9001_AREA7_BASE] = 2;
+    }
     timer_mod(s->t16_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
 }
 
@@ -1670,6 +1713,50 @@ static void g9001_boot_from_nand(G9001State *s)
                 s->cpu->env.regs[11], s->cpu->env.sp, s->cpu->env.ttbr);
 }
 
+/*
+ * Self-test for the panel path: paint a deterministic 640x480 4bpp pattern in
+ * SDRAM, point MADD/MLADD at it and turn the LCDC on, exactly as the firmware
+ * would.  The PGM export then has to show the same image back.
+ */
+static void g9001_lcd_paint_test(G9001State *s)
+{
+    unsigned x;
+    unsigned y;
+
+    if (s->sdram_ptr == NULL) {
+        return;
+    }
+    memset(s->sdram_ptr, 0, G9001_LCD_STRIDE * G9001_LCD_HEIGHT);
+    for (y = 0; y < G9001_LCD_HEIGHT; y++) {
+        uint8_t *row = s->sdram_ptr + (size_t)y * G9001_LCD_STRIDE;
+
+        for (x = 0; x < G9001_LCD_WIDTH; x++) {
+            uint8_t level;
+
+            if (y < 4 || y >= G9001_LCD_HEIGHT - 4 ||
+                x < 4 || x >= G9001_LCD_WIDTH - 4) {
+                level = 0x0;                    /* black border */
+            } else if (x < 240) {
+                level = (y / 30) & 0xf;         /* 16 horizontal bands */
+            } else if (x < 480) {
+                level = ((x / 15) ^ (y / 15)) & 0xf;  /* checkerboard */
+            } else {
+                level = (x - 480) * 15 / 159;   /* horizontal ramp */
+            }
+            row[x / 2] |= (x & 1) ? level : (level << 4);
+        }
+    }
+    stl_le_p(&s->io[G9001_IO_LCDC_HD], 0x0021001a);
+    stl_le_p(&s->io[G9001_IO_LCDC_VD], 0x020a01df);
+    stl_le_p(&s->io[G9001_IO_LCDC_MADD], G9001_SDRAM_BASE);
+    stl_le_p(&s->io[G9001_IO_LCDC_MLADD], G9001_LCD_STRIDE);
+    /* TFT select + LUT bypass (so the 4bpp levels map straight to grey) + 4bpp */
+    stl_le_p(&s->io[G9001_IO_LCDC_DMD], 0x80000012);
+    s->io[G9001_IO_LCDC_PS] = G9001_LCDC_PSAVE_MASK;
+    info_report("g9001-lcd: painted 640x480 4bpp test pattern at 0x%08x "
+                "(stride %u)", G9001_SDRAM_BASE, G9001_LCD_STRIDE);
+}
+
 static void g9001_init(MachineState *machine)
 {
     G9001MachineState *gms = G9001_MACHINE(machine);
@@ -1717,6 +1804,10 @@ static void g9001_init(MachineState *machine)
     memory_region_init_io(&s->card14, NULL, &g9001_card_ops, s,
                           "g9001.card-ce4-area14", G9001_CARD14_SIZE);
     memory_region_add_subregion(sysmem, G9001_CARD14_BASE, &s->card14);
+
+    memory_region_init_io(&s->card11, NULL, &g9001_card_ops, s,
+                          "g9001.card-ce11-area11", G9001_CARD11_SIZE);
+    memory_region_add_subregion(sysmem, G9001_CARD11_BASE, &s->card11);
 
     memory_region_add_subregion(sysmem, G9001_SDRAM_BASE, machine->ram);
     s->sdram_ptr = memory_region_get_ram_ptr(machine->ram);
@@ -1852,6 +1943,26 @@ static void g9001_set_nand_save(Object *obj, bool value, Error **errp)
     G9001_MACHINE(obj)->nand_save = value;
 }
 
+static bool g9001_get_force_event(Object *obj, Error **errp)
+{
+    return G9001_MACHINE(obj)->debug_force_event;
+}
+
+static void g9001_set_force_event(Object *obj, bool value, Error **errp)
+{
+    G9001_MACHINE(obj)->debug_force_event = value;
+}
+
+static bool g9001_get_lcd_test(Object *obj, Error **errp)
+{
+    return G9001_MACHINE(obj)->debug_lcd_test;
+}
+
+static void g9001_set_lcd_test(Object *obj, bool value, Error **errp)
+{
+    G9001_MACHINE(obj)->debug_lcd_test = value;
+}
+
 static void g9001_machine_instance_init(Object *obj)
 {
     G9001MachineState *gms = G9001_MACHINE(obj);
@@ -1929,6 +2040,18 @@ static void g9001_machine_instance_init(Object *obj)
     object_property_set_description(obj, "debug-boot-mode",
                                     "Byte left at A0RAM 0x221 for the second "
                                     "stage (0x400d48 compares it with 1)");
+    object_property_add_bool(obj, "debug-force-event",
+                             g9001_get_force_event,
+                             g9001_set_force_event);
+    object_property_set_description(obj, "debug-force-event",
+                                    "Diagnostic: set [0x4040FC]=1 while the "
+                                    "loader spins on its idle HALT");
+    object_property_add_bool(obj, "debug-lcd-test",
+                             g9001_get_lcd_test, g9001_set_lcd_test);
+    object_property_set_description(obj, "debug-lcd-test",
+                                    "Paint a 640x480 4bpp test pattern into "
+                                    "SDRAM, point the LCDC at it and enable "
+                                    "the panel (verifies the renderer)");
     object_property_add_uint32_ptr(obj, "nand-cle-pin", &gms->nand_cle_pin,
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_set_description(obj, "nand-cle-pin",
