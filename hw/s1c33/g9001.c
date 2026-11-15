@@ -181,6 +181,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(G9001MachineState, G9001_MACHINE)
 #define G9001_NAND_BLOCKS       8184
 #define G9001_NAND_TOTAL        ((uint64_t)G9001_NAND_BLOCK_SIZE * \
                                  G9001_NAND_BLOCKS)
+#define G9001_NAND_MAX_PAGE     4224
 #define G9001_NAND_SMALL_PAGE   512
 #define G9001_NAND_SMALL_OOB    16
 #define G9001_NAND_DEFAULT_ID   0xecda1095u
@@ -213,7 +214,9 @@ typedef struct G9001Nand {
     bool ready_low;
     bool write_protected;
 
-    uint8_t page[G9001_NAND_RAW_PAGE];
+    uint8_t page[G9001_NAND_MAX_PAGE];
+    uint32_t page_size;             /* 2112 (boot) or 4224 (large page) */
+    uint32_t data_size;             /* page_size - 64 */
     int64_t cached_page;            /* -1 when invalid */
     bool page_dirty;
 
@@ -258,6 +261,7 @@ typedef struct G9001MachineState {
     uint32_t nand_ale_pin;
     uint32_t nand_ryby_pin;
     uint32_t nand_ecc_offset;
+    bool nand_kernel_4k;
 } G9001MachineState;
 
 typedef struct G9001T16 {
@@ -451,26 +455,24 @@ static bool g9001_nand_load_page(G9001State *s, uint32_t page)
         n->cached_page = page;
         return false;
     }
-    off = (off_t)page * G9001_NAND_RAW_PAGE;
+    off = (off_t)page * n->page_size;
     if ((uint64_t)off >= n->size) {
-        memset(n->page, 0xff, sizeof(n->page));
+        memset(n->page, 0xff, n->page_size);
         n->cached_page = page;
         return false;
     }
-    got = pread(n->fd, n->page, sizeof(n->page), off);
+    got = pread(n->fd, n->page, n->page_size, off);
     if (got < 0) {
         got = 0;
     }
-    if ((size_t)got < sizeof(n->page)) {
-        memset(n->page + got, 0xff, sizeof(n->page) - got);
+    if ((uint32_t)got < n->page_size) {
+        memset(n->page + got, 0xff, n->page_size - got);
     }
     n->cached_page = page;
     n->page_dirty = false;
     /* "ECC always correct": expose the page's stored parity bytes. */
-    if (s->nand_ecc_offset + sizeof(s->nand_ecc) <= sizeof(n->page)) {
-        memcpy(s->nand_ecc, n->page + s->nand_ecc_offset,
-               sizeof(s->nand_ecc));
-    }
+    memcpy(s->nand_ecc, n->page + n->page_size - sizeof(s->nand_ecc),
+           sizeof(s->nand_ecc));
     return true;
 }
 
@@ -483,8 +485,8 @@ static void g9001_nand_store_page(G9001State *s)
     }
     if (s->machine != NULL &&
         G9001_MACHINE(s->machine)->nand_save) {
-        ssize_t wrote = pwrite(n->fd, n->page, sizeof(n->page),
-                               (off_t)n->cached_page * G9001_NAND_RAW_PAGE);
+        ssize_t wrote = pwrite(n->fd, n->page, n->page_size,
+                               (off_t)n->cached_page * n->page_size);
 
         (void)wrote;
     }
@@ -519,6 +521,10 @@ static void g9001_nand_reset(G9001State *s)
     n->id[3] = (s->machine != NULL ?
                 G9001_MACHINE(s->machine)->nand_id : G9001_NAND_DEFAULT_ID);
     n->id_ptr = 0;
+    if (n->page_size == 0) {
+        n->page_size = G9001_NAND_RAW_PAGE;
+        n->data_size = G9001_NAND_PAGE_DATA;
+    }
 }
 
 /*
@@ -577,18 +583,28 @@ static void g9001_nand_latch_addr(G9001State *s)
     (G9001_NAND_SECTOR_STRIDE * G9001_NAND_SECTORS)
 #define G9001_NAND_ECC_AREA     G9001_NAND_PAGE_DATA
 
-static unsigned g9001_nand_stream_offset(unsigned pos)
+static unsigned g9001_nand_sectors(const G9001Nand *n)
+{
+    return n->data_size / G9001_NAND_SECTOR_DATA;
+}
+
+static unsigned g9001_nand_stream_size(const G9001Nand *n)
+{
+    return g9001_nand_sectors(n) * G9001_NAND_SECTOR_STRIDE;
+}
+
+static unsigned g9001_nand_stream_offset(const G9001Nand *n, unsigned pos)
 {
     unsigned sector = pos / G9001_NAND_SECTOR_STRIDE;
     unsigned off = pos % G9001_NAND_SECTOR_STRIDE;
 
-    if (sector >= G9001_NAND_SECTORS) {
-        return G9001_NAND_STREAM_SIZE;
+    if (sector >= g9001_nand_sectors(n)) {
+        return g9001_nand_stream_size(n);
     }
     if (off < G9001_NAND_SECTOR_DATA) {
         return sector * G9001_NAND_SECTOR_DATA + off;
     }
-    return G9001_NAND_ECC_AREA + sector * G9001_NAND_SECTOR_ECC +
+    return n->data_size + sector * G9001_NAND_SECTOR_ECC +
            (off - G9001_NAND_SECTOR_DATA);
 }
 
@@ -621,9 +637,8 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
             page = g9001_nand_page_of(n->row);
             g9001_nand_load_page(s, page);
             n->data_ptr = n->col;
-        n->raw_stream = n->col >= G9001_NAND_PAGE_DATA;
-            n->raw_stream = n->col >= G9001_NAND_PAGE_DATA;
-            n->data_end = sizeof(n->page);
+        n->raw_stream = n->col >= n->data_size;
+            n->data_end = g9001_nand_stream_size(n);
             n->phase = G9001_NAND_READ;
             break;
         case 0x80:
@@ -635,9 +650,8 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
             page = g9001_nand_page_of(n->row);
             g9001_nand_load_page(s, page);
             n->data_ptr = n->col;
-        n->raw_stream = n->col >= G9001_NAND_PAGE_DATA;
-            n->raw_stream = n->col >= G9001_NAND_PAGE_DATA;
-            n->data_end = sizeof(n->page);
+        n->raw_stream = n->col >= n->data_size;
+            n->data_end = g9001_nand_stream_size(n);
             n->phase = G9001_NAND_STATUS;
             break;
         case 0x60:
@@ -694,21 +708,20 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
             if (n->addr_count >= 3) {
                 g9001_nand_latch_addr(s);
                 n->data_ptr = n->col;
-        n->raw_stream = n->col >= G9001_NAND_PAGE_DATA;
-            n->raw_stream = n->col >= G9001_NAND_PAGE_DATA;
+        n->raw_stream = n->col >= n->data_size;
                 g9001_nand_load_page(s, g9001_nand_page_of(n->row));
             }
             if (n->raw_stream) {
-                if (n->data_ptr < sizeof(n->page)) {
+                if (n->data_ptr < n->page_size) {
                     n->page[n->data_ptr] = *value;
                     n->page_dirty = true;
                     n->program_loaded = true;
                 }
                 n->data_ptr++;
-            } else if (n->data_ptr < G9001_NAND_STREAM_SIZE) {
-                unsigned off = g9001_nand_stream_offset(n->data_ptr);
+            } else if (n->data_ptr < g9001_nand_stream_size(n)) {
+                unsigned off = g9001_nand_stream_offset(n, n->data_ptr);
 
-                if (off < sizeof(n->page)) {
+                if (off < n->page_size) {
                     n->page[off] = *value;
                     n->page_dirty = true;
                     n->program_loaded = true;
@@ -730,8 +743,8 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
         g9001_nand_latch_addr(s);
         g9001_nand_load_page(s, g9001_nand_page_of(n->row));
         n->data_ptr = n->col;
-        n->raw_stream = n->col >= G9001_NAND_PAGE_DATA;
-        n->data_end = G9001_NAND_STREAM_SIZE;
+        n->raw_stream = n->col >= n->data_size;
+        n->data_end = g9001_nand_stream_size(n);
         if (n->phase == G9001_NAND_IDLE) {
             n->phase = G9001_NAND_READ;
         }
@@ -749,8 +762,8 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
             *value = n->data_ptr < sizeof(n->page) ? n->page[n->data_ptr] :
                      0xff;
             n->data_ptr++;
-        } else if (n->data_ptr < G9001_NAND_STREAM_SIZE) {
-            off = g9001_nand_stream_offset(n->data_ptr);
+        } else if (n->data_ptr < g9001_nand_stream_size(n)) {
+            off = g9001_nand_stream_offset(n, n->data_ptr);
             *value = off < sizeof(n->page) ? n->page[off] : 0xff;
             n->data_ptr++;
         } else {
@@ -1604,6 +1617,18 @@ static void g9001_io_write(void *opaque, hwaddr offset, uint64_t value,
         case G9001_IO_SDRAMC_INI:
             s->io[off] = v;
             break;
+        case G9001_IO_CARDSETUP:
+            s->io[off] = v;
+            if ((v & 0x03) == 0x03 && s->machine != NULL &&
+                G9001_MACHINE(s->machine)->nand_kernel_4k &&
+                s->nand.page_size != 4224) {
+                s->nand.page_size = 4224;
+                s->nand.data_size = 4096;
+                s->nand.cached_page = -1;
+                info_report("g9001-nand: geometry switched to 4 KiB pages "
+                            "(#CE11 selected)");
+            }
+            break;
         default:
             s->io[off] = v;
             break;
@@ -2019,6 +2044,16 @@ static void g9001_set_nand_save(Object *obj, bool value, Error **errp)
     G9001_MACHINE(obj)->nand_save = value;
 }
 
+static bool g9001_get_kernel_4k(Object *obj, Error **errp)
+{
+    return G9001_MACHINE(obj)->nand_kernel_4k;
+}
+
+static void g9001_set_kernel_4k(Object *obj, bool value, Error **errp)
+{
+    G9001_MACHINE(obj)->nand_kernel_4k = value;
+}
+
 static bool g9001_get_force_event(Object *obj, Error **errp)
 {
     return G9001_MACHINE(obj)->debug_force_event;
@@ -2122,6 +2157,11 @@ static void g9001_machine_instance_init(Object *obj)
     object_property_set_description(obj, "debug-boot-mode",
                                     "Byte left at A0RAM 0x221 for the second "
                                     "stage (0x400d48 compares it with 1)");
+    object_property_add_bool(obj, "nand-kernel-4k",
+                             g9001_get_kernel_4k, g9001_set_kernel_4k);
+    object_property_set_description(obj, "nand-kernel-4k",
+                                    "Switch the NAND geometry to 4 KiB pages "
+                                    "when the kernel programs pCARDSETUP");
     object_property_add_bool(obj, "debug-force-event",
                              g9001_get_force_event,
                              g9001_set_force_event);
