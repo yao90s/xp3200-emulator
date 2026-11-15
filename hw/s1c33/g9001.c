@@ -230,6 +230,7 @@ typedef struct G9001Nand {
     uint32_t data_ptr;
     uint32_t data_end;
     unsigned ecc_sector;
+    bool raw_stream;                /* reading the spare area directly */
     bool program_loaded;
 } G9001Nand;
 
@@ -245,6 +246,7 @@ typedef struct G9001MachineState {
     uint32_t debug_pc_sample_ms;
     bool trace_io;
     bool trace_nand;
+    bool trace_nand_kernel;
     bool trace_irq;
     uint32_t t16_hz;
     uint32_t debug_p1_low_mask;     /* force P1 input bits low */
@@ -275,6 +277,7 @@ typedef struct G9001State {
     bool lcd_dirty;
     bool trace_io;
     bool trace_nand;
+    bool trace_nand_kernel;
     bool trace_irq;
     uint32_t debug_p1_low_mask;
     uint32_t debug_usbctl;
@@ -314,6 +317,9 @@ typedef struct G9001State {
     bool trace_nand_window_seen;
     uint64_t card_reads;
     uint64_t card_writes;
+    uint64_t card_win_reads[3];
+    uint64_t card_win_writes[3];
+    bool card_win_seen[3];
 
     /* machine */
     MachineState *machine;
@@ -342,6 +348,7 @@ static uint8_t g9001_port_data(G9001State *s, unsigned port);
 static uint8_t g9001_port_dir(G9001State *s, unsigned port);
 static uint8_t g9001_port_pins(G9001State *s, unsigned port);
 static void g9001_lcd_paint_test(G9001State *s);
+static bool g9001_pin_level(G9001State *s, uint32_t pin);
 
 /* ------------------------------------------------------------------------- */
 /* helpers                                                                   */
@@ -597,7 +604,6 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
 
     if (command) {
         n->cmd = *value;
-        n->addr_count = 0;
         n->data_ptr = 0;
         n->program_loaded = false;
         if (s->trace_nand) {
@@ -615,6 +621,8 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
             page = g9001_nand_page_of(n->row);
             g9001_nand_load_page(s, page);
             n->data_ptr = n->col;
+        n->raw_stream = n->col >= G9001_NAND_PAGE_DATA;
+            n->raw_stream = n->col >= G9001_NAND_PAGE_DATA;
             n->data_end = sizeof(n->page);
             n->phase = G9001_NAND_READ;
             break;
@@ -627,6 +635,8 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
             page = g9001_nand_page_of(n->row);
             g9001_nand_load_page(s, page);
             n->data_ptr = n->col;
+        n->raw_stream = n->col >= G9001_NAND_PAGE_DATA;
+            n->raw_stream = n->col >= G9001_NAND_PAGE_DATA;
             n->data_end = sizeof(n->page);
             n->phase = G9001_NAND_STATUS;
             break;
@@ -684,9 +694,18 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
             if (n->addr_count >= 3) {
                 g9001_nand_latch_addr(s);
                 n->data_ptr = n->col;
+        n->raw_stream = n->col >= G9001_NAND_PAGE_DATA;
+            n->raw_stream = n->col >= G9001_NAND_PAGE_DATA;
                 g9001_nand_load_page(s, g9001_nand_page_of(n->row));
             }
-            if (n->data_ptr < G9001_NAND_STREAM_SIZE) {
+            if (n->raw_stream) {
+                if (n->data_ptr < sizeof(n->page)) {
+                    n->page[n->data_ptr] = *value;
+                    n->page_dirty = true;
+                    n->program_loaded = true;
+                }
+                n->data_ptr++;
+            } else if (n->data_ptr < G9001_NAND_STREAM_SIZE) {
                 unsigned off = g9001_nand_stream_offset(n->data_ptr);
 
                 if (off < sizeof(n->page)) {
@@ -711,6 +730,7 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
         g9001_nand_latch_addr(s);
         g9001_nand_load_page(s, g9001_nand_page_of(n->row));
         n->data_ptr = n->col;
+        n->raw_stream = n->col >= G9001_NAND_PAGE_DATA;
         n->data_end = G9001_NAND_STREAM_SIZE;
         if (n->phase == G9001_NAND_IDLE) {
             n->phase = G9001_NAND_READ;
@@ -725,7 +745,11 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
     case G9001_NAND_READ: {
         unsigned off;
 
-        if (n->data_ptr < G9001_NAND_STREAM_SIZE) {
+        if (n->raw_stream) {
+            *value = n->data_ptr < sizeof(n->page) ? n->page[n->data_ptr] :
+                     0xff;
+            n->data_ptr++;
+        } else if (n->data_ptr < G9001_NAND_STREAM_SIZE) {
             off = g9001_nand_stream_offset(n->data_ptr);
             *value = off < sizeof(n->page) ? n->page[off] : 0xff;
             n->data_ptr++;
@@ -747,10 +771,128 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
 }
 
 /*
- * The card window is a plain memory area. CLE/ALE are GPIO pins; when they
- * are not wired up we fall back to "every access is a data access", which is
- * enough for the boot ROM emulation and for tracing the real pin usage.
+ * The card interface is a plain memory window; CLE/ALE are GPIO pins and
+ * #CE/#RE/#WE come from the bus.  Three windows are mapped because the
+ * firmware moves the decode with pCARDSETUP:
+ *   #CE4  -> Area 4  (0x00100000, 1 MiB)     - boot ROM / MBR default
+ *   #CE11 -> Area 11 (0x01000000, 8 MiB)     - what the kernel selects (0x03)
+ *   #CE11 -> Area 14 (0x03000000, 16 MiB)    - alternate decode
+ * Each window keeps its own access counters so we can see which one the
+ * firmware really uses.
  */
+typedef enum G9001CardWin {
+    G9001_CARD_WIN_4 = 0,
+    G9001_CARD_WIN_11,
+    G9001_CARD_WIN_14,
+    G9001_CARD_WINS
+} G9001CardWin;
+
+static uint64_t g9001_card_read_win(G9001State *s, G9001CardWin win,
+                                    hwaddr offset, unsigned size)
+{
+    G9001MachineState *gms = G9001_MACHINE(s->machine);
+    uint64_t ret = 0;
+    bool cle = g9001_pin_level(s, gms->nand_cle_pin);
+    bool ale = g9001_pin_level(s, gms->nand_ale_pin);
+    unsigned i;
+
+    if (win != G9001_CARD_WIN_4 && !s->card_win_seen[win]) {
+        s->card_win_seen[win] = true;
+        info_report("g9001: first card read via window %s at 0x%08" HWADDR_PRIx
+                    " pc=0x%08x (cle=%d ale=%d)",
+                    win == G9001_CARD_WIN_11 ? "Area11" : "Area14",
+                    (hwaddr)(win == G9001_CARD_WIN_11 ? G9001_CARD11_BASE :
+                             G9001_CARD14_BASE) + offset,
+                    g9001_current_pc(), cle, ale);
+    }
+    if (!s->trace_nand_window_seen) {
+        s->trace_nand_window_seen = true;
+        info_report("g9001: first card window read at 0x%08" HWADDR_PRIx
+                    " pc=0x%08x (cle=%d ale=%d)",
+                    (hwaddr)G9001_CARD4_BASE + offset,
+                    g9001_current_pc(), cle, ale);
+        g9001_trace_dump(s, "first card window read");
+    }
+
+    for (i = 0; i < size; i++) {
+        uint8_t v = 0xff;
+
+        g9001_nand_byte(s, cle, ale, false, &v);
+        ret |= (uint64_t)v << (8 * i);
+        if (win != G9001_CARD_WIN_4 && s->trace_nand_kernel &&
+            s->card_win_reads[win] < 4096) {
+            info_report("g9001-knand: rd win=%u cle=%d ale=%d val=0x%02x "
+                        "pc=0x%08x", win, cle, ale, v, g9001_current_pc());
+        }
+    }
+    s->card_reads++;
+    s->card_win_reads[win]++;
+    return ret;
+}
+
+static void g9001_card_write_win(G9001State *s, G9001CardWin win,
+                                 hwaddr offset, uint64_t value, unsigned size)
+{
+    G9001MachineState *gms = G9001_MACHINE(s->machine);
+    bool cle = g9001_pin_level(s, gms->nand_cle_pin);
+    bool ale = g9001_pin_level(s, gms->nand_ale_pin);
+    unsigned i;
+
+    if (win != G9001_CARD_WIN_4 && !s->card_win_seen[win]) {
+        s->card_win_seen[win] = true;
+        info_report("g9001: first card write via window %s at 0x%08" HWADDR_PRIx
+                    " value=0x%" PRIx64 " pc=0x%08x (cle=%d ale=%d)",
+                    win == G9001_CARD_WIN_11 ? "Area11" : "Area14",
+                    (hwaddr)(win == G9001_CARD_WIN_11 ? G9001_CARD11_BASE :
+                             G9001_CARD14_BASE) + offset, value,
+                    g9001_current_pc(), cle, ale);
+    }
+    if (!s->trace_nand_window_seen) {
+        s->trace_nand_window_seen = true;
+        info_report("g9001: first card window write at 0x%08" HWADDR_PRIx
+                    " value=0x%" PRIx64 " pc=0x%08x (cle=%d ale=%d)",
+                    (hwaddr)G9001_CARD4_BASE + offset, value,
+                    g9001_current_pc(), cle, ale);
+        g9001_trace_dump(s, "first card window write");
+    }
+
+    for (i = 0; i < size; i++) {
+        uint8_t v = (value >> (8 * i)) & 0xff;
+
+        if (win != G9001_CARD_WIN_4 && s->trace_nand_kernel &&
+            s->card_win_writes[win] < 4096) {
+            info_report("g9001-knand: wr win=%u cle=%d ale=%d val=0x%02x "
+                        "pc=0x%08x", win, cle, ale, v, g9001_current_pc());
+        }
+        g9001_nand_byte(s, cle, ale, true, &v);
+    }
+    s->card_writes++;
+    s->card_win_writes[win]++;
+}
+
+#define G9001_CARD_ACCESSORS(win_enum, name)                                  \
+    static uint64_t g9001_card_read_##name(void *opaque, hwaddr offset,       \
+                                           unsigned size)                     \
+    {                                                                         \
+        return g9001_card_read_win(opaque, win_enum, offset, size);           \
+    }                                                                         \
+    static void g9001_card_write_##name(void *opaque, hwaddr offset,          \
+                                        uint64_t value, unsigned size)        \
+    {                                                                         \
+        g9001_card_write_win(opaque, win_enum, offset, value, size);          \
+    }                                                                         \
+    static const MemoryRegionOps g9001_card_ops_##name = {                    \
+        .read = g9001_card_read_##name,                                       \
+        .write = g9001_card_write_##name,                                     \
+        .endianness = DEVICE_LITTLE_ENDIAN,                                   \
+        .valid = { .min_access_size = 1, .max_access_size = 4,                \
+                   .unaligned = true },                                       \
+        .impl = { .min_access_size = 1, .max_access_size = 1 },               \
+    }
+
+G9001_CARD_ACCESSORS(G9001_CARD_WIN_4, area4);
+G9001_CARD_ACCESSORS(G9001_CARD_WIN_11, area11);
+G9001_CARD_ACCESSORS(G9001_CARD_WIN_14, area14);
 static bool g9001_pin_level(G9001State *s, uint32_t pin)
 {
     unsigned port;
@@ -766,75 +908,6 @@ static bool g9001_pin_level(G9001State *s, uint32_t pin)
     }
     return (g9001_port_data(s, port) >> bit) & 1;
 }
-
-static uint64_t g9001_card_read(void *opaque, hwaddr offset, unsigned size)
-{
-    G9001State *s = opaque;
-    G9001MachineState *gms = G9001_MACHINE(s->machine);
-    uint64_t ret = 0;
-    bool cle = g9001_pin_level(s, gms->nand_cle_pin);
-    bool ale = g9001_pin_level(s, gms->nand_ale_pin);
-    unsigned i;
-
-    if (!s->trace_nand_window_seen) {
-        s->trace_nand_window_seen = true;
-        info_report("g9001: first card window read at 0x%08" HWADDR_PRIx
-                    " pc=0x%08x (cle=%d ale=%d)",
-                    (hwaddr)G9001_CARD4_BASE + offset,
-                    g9001_current_pc(), cle, ale);
-        g9001_trace_dump(s, "first card window read");
-    }
-
-    for (i = 0; i < size; i++) {
-        uint8_t v = 0xff;
-
-        g9001_nand_byte(s, cle, ale, false, &v);
-        ret |= (uint64_t)v << (8 * i);
-    }
-    s->card_reads++;
-    return ret;
-}
-
-static void g9001_card_write(void *opaque, hwaddr offset, uint64_t value,
-                             unsigned size)
-{
-    G9001State *s = opaque;
-    G9001MachineState *gms = G9001_MACHINE(s->machine);
-    bool cle = g9001_pin_level(s, gms->nand_cle_pin);
-    bool ale = g9001_pin_level(s, gms->nand_ale_pin);
-    unsigned i;
-
-    if (!s->trace_nand_window_seen) {
-        s->trace_nand_window_seen = true;
-        info_report("g9001: first card window write at 0x%08" HWADDR_PRIx
-                    " value=0x%" PRIx64 " pc=0x%08x (cle=%d ale=%d)",
-                    (hwaddr)G9001_CARD4_BASE + offset, value,
-                    g9001_current_pc(), cle, ale);
-        g9001_trace_dump(s, "first card window write");
-    }
-
-    for (i = 0; i < size; i++) {
-        uint8_t v = (value >> (8 * i)) & 0xff;
-
-        g9001_nand_byte(s, cle, ale, true, &v);
-    }
-    s->card_writes++;
-}
-
-static const MemoryRegionOps g9001_card_ops = {
-    .read = g9001_card_read,
-    .write = g9001_card_write,
-    .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = {
-        .min_access_size = 1,
-        .max_access_size = 4,
-        .unaligned = true,
-    },
-    .impl = {
-        .min_access_size = 1,
-        .max_access_size = 1,
-    },
-};
 
 /* ------------------------------------------------------------------------- */
 /* LCD                                                                       */
@@ -1768,6 +1841,7 @@ static void g9001_init(MachineState *machine)
     s->nand.cached_page = -1;
     s->trace_io = gms->trace_io;
     s->trace_nand = gms->trace_nand;
+    s->trace_nand_kernel = gms->trace_nand_kernel;
     s->trace_irq = gms->trace_irq;
     s->t16_hz = gms->t16_hz;
     s->debug_p1_low_mask = gms->debug_p1_low_mask;
@@ -1797,15 +1871,15 @@ static void g9001_init(MachineState *machine)
                           "g9001.e08-io", G9001_IO_SIZE);
     memory_region_add_subregion(sysmem, G9001_IO_BASE, &s->io_region);
 
-    memory_region_init_io(&s->card4, NULL, &g9001_card_ops, s,
+    memory_region_init_io(&s->card4, NULL, &g9001_card_ops_area4, s,
                           "g9001.card-ce4", G9001_CARD4_SIZE);
     memory_region_add_subregion(sysmem, G9001_CARD4_BASE, &s->card4);
 
-    memory_region_init_io(&s->card14, NULL, &g9001_card_ops, s,
-                          "g9001.card-ce4-area14", G9001_CARD14_SIZE);
+    memory_region_init_io(&s->card14, NULL, &g9001_card_ops_area14, s,
+                          "g9001.card-area14", G9001_CARD14_SIZE);
     memory_region_add_subregion(sysmem, G9001_CARD14_BASE, &s->card14);
 
-    memory_region_init_io(&s->card11, NULL, &g9001_card_ops, s,
+    memory_region_init_io(&s->card11, NULL, &g9001_card_ops_area11, s,
                           "g9001.card-ce11-area11", G9001_CARD11_SIZE);
     memory_region_add_subregion(sysmem, G9001_CARD11_BASE, &s->card11);
 
@@ -1894,6 +1968,16 @@ static bool g9001_get_trace_nand(Object *obj, Error **errp)
 static void g9001_set_trace_nand(Object *obj, bool value, Error **errp)
 {
     G9001_MACHINE(obj)->trace_nand = value;
+}
+
+static bool g9001_get_trace_nand_kernel(Object *obj, Error **errp)
+{
+    return G9001_MACHINE(obj)->trace_nand_kernel;
+}
+
+static void g9001_set_trace_nand_kernel(Object *obj, bool value, Error **errp)
+{
+    G9001_MACHINE(obj)->trace_nand_kernel = value;
 }
 
 static bool g9001_get_trace_irq(Object *obj, Error **errp)
@@ -2014,6 +2098,12 @@ static void g9001_machine_instance_init(Object *obj)
                              g9001_set_trace_nand);
     object_property_set_description(obj, "trace-nand",
                                     "Log NAND command/address/data activity");
+    object_property_add_bool(obj, "trace-nand-kernel",
+                             g9001_get_trace_nand_kernel,
+                             g9001_set_trace_nand_kernel);
+    object_property_set_description(obj, "trace-nand-kernel",
+                                    "Log only the kernel NAND accesses "
+                                    "(Area 11/14 windows, not the MBR)");
     object_property_add_bool(obj, "trace-irq", g9001_get_trace_irq,
                              g9001_set_trace_irq);
     object_property_set_description(obj, "trace-irq",
