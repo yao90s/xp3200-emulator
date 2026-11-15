@@ -588,7 +588,11 @@ static void gen_software_interrupt(DisasContext *ctx, uint16_t word)
     tcg_gen_andi_i32(vector_addr, cpu_ttbr, S1C33_TTBR_MASK);
     tcg_gen_addi_i32(vector_addr, vector_addr, vector_offset);
     tcg_gen_qemu_ld_i32(target, vector_addr, 0, MO_LEUL);
-    tcg_gen_ori_i32(cpu_psr, cpu_psr, S1C33_PSR_IE);
+    /*
+     * Entering a trap clears IE (manual: "进入 trap 时硬件清 0");
+     * the handler restores the saved PSR explicitly.
+     */
+    tcg_gen_andi_i32(cpu_psr, cpu_psr, ~S1C33_PSR_IE);
     gen_clear_ext(ctx);
     tcg_gen_mov_i32(cpu_pc, target);
     tcg_gen_lookup_and_goto_ptr();
