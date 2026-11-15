@@ -31,7 +31,9 @@ enum {
 #define S1C33_PSR_MO         (1u << 7)
 #define S1C33_PSR_IL_SHIFT   8
 #define S1C33_PSR_IL_MASK    (0xfu << S1C33_PSR_IL_SHIFT)
-#define S1C33_TTBR_MASK      0x0ffffc00u
+/* Trap table base: 1 KiB aligned.  Keep the high bits - the E08 maps SDRAM
+ * up to 0x12000000 and the firmware installs its own table at 0x11e84000. */
+#define S1C33_TTBR_MASK      0xfffffc00u
 #define S1C33_TRAP_NMI_VECTOR 7
 #define S1C33_CPU_INTERRUPT_NMI CPU_INTERRUPT_TGT_EXT_3
 
