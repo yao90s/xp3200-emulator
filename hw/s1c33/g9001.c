@@ -242,6 +242,7 @@ typedef struct G9001MachineState {
     uint32_t t16_hz;
     uint32_t debug_p1_low_mask;     /* force P1 input bits low */
     uint32_t debug_usbctl;          /* 0=as written, 1=bit7 set, 2=bit7 clear */
+    uint32_t debug_boot_mode;       /* value left at A0RAM 0x221 */
     uint32_t nand_cle_pin;          /* port * 8 + bit, 0xffffffff = not wired */
     uint32_t nand_ale_pin;
     uint32_t nand_ryby_pin;
@@ -268,6 +269,7 @@ typedef struct G9001State {
     bool trace_irq;
     uint32_t debug_p1_low_mask;
     uint32_t debug_usbctl;
+    uint32_t debug_boot_mode;
 
     /* LCD */
     QemuConsole *con;
@@ -1071,12 +1073,15 @@ static void g9001_pc_sample_cb(void *opaque)
     G9001MachineState *gms = G9001_MACHINE(s->machine);
 
     info_report("g9001-pc: pc=0x%08x sp=0x%08x psr=0x%08x ttbr=0x%08x "
-                "lcd_ps=0x%02x madd=0x%08x disp=0x%08x t16(ctl=0x%02x "
+                "lcd_ps=0x%02x madd=0x%08x disp=0x%08x a0221=0x%02x "
+                "a03f3=0x%02x t16(ctl=0x%02x "
                 "cnt=%u ca=%u cb=%u ie=0x%02x il=0x%02x fl=0x%02x)",
                 g9001_current_pc(), s->cpu->env.sp, s->cpu->env.psr,
                 s->cpu->env.ttbr, s->io[G9001_IO_LCDC_PS],
                 g9001_lcdc32(s, G9001_IO_LCDC_MADD),
                 s->a0ram_ptr != NULL ? ldl_le_p(s->a0ram_ptr + 0x678) : 0,
+                s->a0ram_ptr != NULL ? s->a0ram_ptr[0x221] : 0,
+                s->a0ram_ptr != NULL ? s->a0ram_ptr[0x3f3] : 0,
                 s->t16.ctl, s->t16.counter, s->t16.ca, s->t16.cb,
                 s->io[G9001_IO_INT_E16T01], s->io[0x0266],
                 s->io[0x0282]);
@@ -1616,6 +1621,18 @@ static void g9001_boot_from_nand(G9001State *s)
     memcpy(s->a0ram_ptr, rom + 4, G9001_NAND_SMALL_PAGE - 4);
 
     /*
+     * The boot ROM leaves a small parameter block at the top of A0RAM; the
+     * second stage reads 0x221 (boot mode, compared with 1 at 0x400d48) and
+     * 0x3f3 (SDRAM size in MiB, shifted by 20 at 0x400e46).  Seed the values
+     * the MBR has been seen to pass on (r2 = 0x20) and let the experiment
+     * properties override the mode byte.
+     */
+    s->a0ram_ptr[0x221] = gms->debug_boot_mode & 0xff;
+    if (s->a0ram_ptr[0x3f3] == 0) {
+        s->a0ram_ptr[0x3f3] = 0x20;
+    }
+
+    /*
      * Register state handed over by the boot ROM: r10/r11 point at the
      * external area 4 base and the internal I/O base (the MBR uses r11 as the
      * peripheral base), and SP has to point into A0RAM because the first
@@ -1668,6 +1685,7 @@ static void g9001_init(MachineState *machine)
     s->t16_hz = gms->t16_hz;
     s->debug_p1_low_mask = gms->debug_p1_low_mask;
     s->debug_usbctl = gms->debug_usbctl;
+    s->debug_boot_mode = gms->debug_boot_mode;
     s->nand_ecc_offset = gms->nand_ecc_offset;
 
     memory_region_init_ram(&s->a0ram, NULL, "g9001.a0ram",
@@ -1905,6 +1923,12 @@ static void g9001_machine_instance_init(Object *obj)
     object_property_set_description(obj, "debug-usbctl",
                                     "Override USB_Control (0x300921) bit7: "
                                     "0 = as written, 1 = set, 2 = clear");
+    object_property_add_uint32_ptr(obj, "debug-boot-mode",
+                                   &gms->debug_boot_mode,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "debug-boot-mode",
+                                    "Byte left at A0RAM 0x221 for the second "
+                                    "stage (0x400d48 compares it with 1)");
     object_property_add_uint32_ptr(obj, "nand-cle-pin", &gms->nand_cle_pin,
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_set_description(obj, "nand-cle-pin",
