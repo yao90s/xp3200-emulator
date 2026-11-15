@@ -269,6 +269,7 @@ typedef struct G9001MachineState {
     uint32_t debug_pc_sample_ms;
     bool trace_io;
     bool trace_nand;
+    bool trace_nand_latch;
     bool trace_nand_kernel;
     uint32_t trace_nand_kernel_pc_min;
     bool trace_irq;
@@ -370,6 +371,7 @@ typedef struct G9001State {
     bool lcd_dirty;
     bool trace_io;
     bool trace_nand;
+    bool trace_nand_latch;
     bool trace_nand_kernel;
     uint32_t trace_nand_kernel_pc_min;
     bool trace_irq;
@@ -729,7 +731,7 @@ static void g9001_nand_latch_addr(G9001State *s)
     if (n->row > s->nand_max_row) {
         s->nand_max_row = n->row;
     }
-    if (s->trace_nand && n->addr_count) {
+    if ((s->trace_nand || s->trace_nand_latch) && n->addr_count) {
         info_report("g9001-nand: latch %u bytes -> col=%u row=%u "
                     "(byte offset %" PRIu64 ")",
                     n->addr_count, n->col, n->row,
@@ -2556,6 +2558,7 @@ static void g9001_init(MachineState *machine)
     s->nand.cached_page = -1;
     s->trace_io = gms->trace_io;
     s->trace_nand = gms->trace_nand;
+    s->trace_nand_latch = gms->trace_nand_latch;
     s->trace_nand_kernel = gms->trace_nand_kernel;
     s->trace_nand_kernel_pc_min = gms->trace_nand_kernel_pc_min;
     g9001_mmc_default_identity(&s->mmc);
@@ -2780,6 +2783,16 @@ static bool g9001_get_trace_nand_kernel(Object *obj, Error **errp)
 static void g9001_set_trace_nand_kernel(Object *obj, bool value, Error **errp)
 {
     G9001_MACHINE(obj)->trace_nand_kernel = value;
+}
+
+static bool g9001_get_trace_nand_latch(Object *obj, Error **errp)
+{
+    return G9001_MACHINE(obj)->trace_nand_latch;
+}
+
+static void g9001_set_trace_nand_latch(Object *obj, bool value, Error **errp)
+{
+    G9001_MACHINE(obj)->trace_nand_latch = value;
 }
 
 static bool g9001_get_trace_irq(Object *obj, Error **errp)
@@ -3025,6 +3038,12 @@ static void g9001_machine_instance_init(Object *obj)
                              g9001_set_trace_nand);
     object_property_set_description(obj, "trace-nand",
                                     "Log NAND command/address/data activity");
+    object_property_add_bool(obj, "trace-nand-latch",
+                             g9001_get_trace_nand_latch,
+                             g9001_set_trace_nand_latch);
+    object_property_set_description(obj, "trace-nand-latch",
+                                    "Log only the latched (col,row) of every "
+                                    "NAND command, without the per-byte noise");
     object_property_add_bool(obj, "trace-nand-kernel",
                              g9001_get_trace_nand_kernel,
                              g9001_set_trace_nand_kernel);
