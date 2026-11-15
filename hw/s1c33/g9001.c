@@ -112,6 +112,12 @@ OBJECT_DECLARE_SIMPLE_TYPE(G9001MachineState, G9001_MACHINE)
 #define G9001_IO_SPI_CTL1       0x001708
 #define G9001_IO_SPI_CTL2       0x00170c
 #define G9001_IO_SPI_WAIT       0x001710
+#define G9001_IO_HS2_CNT    0x1140
+#define G9001_IO_HS2_CTL    0x1142
+#define G9001_IO_HS2_STAT   0x114b
+#define G9001_IO_HS2_SADR   0x1184
+#define G9001_IO_HS2_DADR   0x1188
+
 #define G9001_IO_SPI_STAT       0x001714
 #define G9001_IO_SPI_INT        0x001718
 #define G9001_IO_SPI_RXMK       0x00171c
@@ -368,6 +374,9 @@ typedef struct G9001State {
     bool irq_active;
     uint8_t irq_vector;
     uint8_t irq_prio;
+
+    uint64_t hsdma_copies;
+    bool hsdma_busy;
 
     /* SPI + MMC card */
     G9001Spi spi;
@@ -1836,6 +1845,39 @@ static void g9001_t16_cb(void *opaque)
 /* I/O register window                                                       */
 /* ------------------------------------------------------------------------- */
 
+/*
+ * Minimal HSDMA: the guest programs count/source/destination and a start bit;
+ * we perform the block move synchronously.  Source or destination may be the
+ * card window, in which case reading it pops one byte from the NAND stream.
+ */
+static void g9001_hsdma_run(G9001State *s)
+{
+    uint32_t count = lduw_le_p(&s->io[G9001_IO_HS2_CNT]);
+    uint32_t src = ldl_le_p(&s->io[G9001_IO_HS2_SADR]);
+    uint32_t dst = ldl_le_p(&s->io[G9001_IO_HS2_DADR]);
+    uint8_t *buf;
+    uint32_t i;
+
+    if (count == 0 || count > 64 * 1024) {
+        return;
+    }
+    buf = g_malloc(count);
+    for (i = 0; i < count; i++) {
+        buf[i] = address_space_ldub(&address_space_memory,
+                                    (hwaddr)src + i, MEMTXATTRS_UNSPECIFIED,
+                                    NULL);
+    }
+    address_space_write(&address_space_memory, (hwaddr)dst,
+                        MEMTXATTRS_UNSPECIFIED, buf, count);
+    g_free(buf);
+    s->io[G9001_IO_HS2_STAT] |= 0xc1;       /* done + enable */
+    s->hsdma_copies++;
+    if (s->trace_io) {
+        info_report("g9001-hsdma: copy %u bytes 0x%08x -> 0x%08x", count, src,
+                    dst);
+    }
+}
+
 static uint64_t g9001_io_read(void *opaque, hwaddr offset, unsigned size)
 {
     G9001State *s = opaque;
@@ -2023,6 +2065,14 @@ static void g9001_io_write(void *opaque, hwaddr offset, uint64_t value,
         case G9001_IO_SPI_RXD + 3:
             /* clear the receive flag on read */
             s->spi.rxd_valid = false;
+            break;
+        case G9001_IO_HS2_STAT:
+            s->io[off] = v;
+            if ((v & 0x40) && !(s->hsdma_busy)) {
+                s->hsdma_busy = true;
+                g9001_hsdma_run(s);
+                s->hsdma_busy = false;
+            }
             break;
         case G9001_IO_CARDSETUP:
             s->io[off] = v;
