@@ -76,7 +76,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(G9001MachineState, G9001_MACHINE)
 #define G9001_IO_BASE           0x00300000u
 #define G9001_IO_SIZE           0x00004000u
 #define G9001_SDRAM_BASE        0x10000000u
-#define G9001_DEFAULT_RAM       (16 * MiB)
+#define G9001_DEFAULT_RAM       (32 * MiB)   /* the kernel size byte says 32 MB */
 #define G9001_BOOT_STACK_TOP    0x00003f80u
 
 /* S1C33E08 internal I/O register addresses (Area 6). */
