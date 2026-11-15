@@ -1,0 +1,110 @@
+name: S1C33 smoke tests
+
+# Build qemu-system-s1c33 on Linux and run the machine smoke tests.
+#
+# The firmware images are not part of the repo, so the two smoke steps only
+# run when the corresponding repository variables are set:
+#
+#   XP3200_NAND_URL  XP3200_NOR_URL  G9001_NAND_URL
+#
+# Point them at release assets (or any HTTPS URL) to turn this into a full
+# regression gate for both machines that share target/s1c33.
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: s1c33-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-smoke:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    env:
+      XP3200_NAND_URL: ${{ vars.XP3200_NAND_URL }}
+      XP3200_NOR_URL: ${{ vars.XP3200_NOR_URL }}
+      G9001_NAND_URL: ${{ vars.G9001_NAND_URL }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Preserve Unix line endings
+        run: git config --global core.autocrlf input
+
+      # Python 3.11 ships setuptools 65, which supports the PEP 660 editable
+      # install that QEMU's "tooling" group needs for its own python package.
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ninja-build pkg-config \
+            libglib2.0-dev libpixman-1-dev zlib1g-dev
+
+      - name: Configure QEMU
+        run: |
+          mkdir -p _build
+          cd _build
+          ../configure \
+            --target-list=s1c33-softmmu \
+            --without-default-features \
+            --enable-tcg \
+            --enable-pixman \
+            --disable-sdl \
+            --disable-gtk \
+            --disable-docs \
+            --disable-tools \
+            --disable-werror
+
+      - name: Build QEMU
+        run: ninja -C _build qemu-system-s1c33
+
+      - name: Check the machine list
+        run: |
+          _build/qemu-system-s1c33 -M help | tee machines.txt
+          for m in xp3200 xp3200s bbk9288 bbk9288s g9001; do
+            grep -q "^$m " machines.txt || { echo "missing machine: $m"; exit 1; }
+          done
+
+      - name: Smoke test XP3200
+        if: env.XP3200_NAND_URL != '' && env.XP3200_NOR_URL != ''
+        run: |
+          mkdir -p fw
+          curl -fsSL "$XP3200_NAND_URL" -o fw/nand.img
+          curl -fsSL "$XP3200_NOR_URL" -o fw/nor.bin
+          NAND=fw/nand.img NOR=fw/nor.bin \
+            QEMU=_build/qemu-system-s1c33 OUT=/tmp/xp3200-smoke \
+            bash scripts/xp3200/smoke.sh
+
+      - name: Smoke test G9001
+        if: env.G9001_NAND_URL != ''
+        run: |
+          mkdir -p fw
+          curl -fsSL "$G9001_NAND_URL" -o fw/g9001.img
+          NAND=fw/g9001.img \
+            QEMU=_build/qemu-system-s1c33 OUT=/tmp/g9001-smoke \
+            bash scripts/g9001/smoke.sh
+
+      - name: Upload smoke artefacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: s1c33-smoke-output
+          path: |
+            /tmp/xp3200-smoke
+            /tmp/g9001-smoke
+          if-no-files-found: ignore
+          retention-days: 7
