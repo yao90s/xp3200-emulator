@@ -302,6 +302,7 @@ typedef struct G9001MachineState {
     uint32_t nand_ecc_offset;
     bool nand_kernel_4k;
     bool nand_ignore_ecc;
+    bool nand_ecc_gen;
     bool nand_spare_real;
     bool nand_spare_stream;
     bool nand_spare_per_sector;
@@ -399,6 +400,15 @@ typedef struct G9001State {
     G9001Nand nand;
     uint8_t nand_ecc[8];            /* last ECC bytes of the current page */
     uint32_t nand_ecc_offset;
+    /* E08 ECC generator (manual V.4.6): two 256-byte areas per 512B transfer */
+    struct {
+        bool enabled;
+        bool gen;                   /* expose the computed ECC in the registers */
+        uint8_t cp[2];
+        uint16_t lp[2];
+        unsigned count[2];
+        unsigned pos;
+    } ecc;
 
     /* interrupt controller */
     uint8_t irq_pending_mask[16];
@@ -851,6 +861,46 @@ static bool g9001_nand_raw_col(G9001State *s)
     return !s->nand.spare_stream && s->nand.col >= s->nand.data_size;
 }
 
+static void g9001_ecc_reset(G9001State *s)
+{
+    memset(s->ecc.cp, 0, sizeof(s->ecc.cp));
+    memset(s->ecc.lp, 0, sizeof(s->ecc.lp));
+    memset(s->ecc.count, 0, sizeof(s->ecc.count));
+    s->ecc.pos = 0;
+}
+
+/* Manual V.4.6: 6-bit column parity + 16-bit line parity per 256-byte area. */
+static void g9001_ecc_byte(G9001State *s, uint8_t din)
+{
+    unsigned area, count;
+    unsigned b[8];
+    unsigned k;
+
+    if (!s->ecc.enabled || s->ecc.pos >= 512) {
+        s->ecc.pos++;
+        return;
+    }
+    area = s->ecc.pos < 256 ? 0 : 1;
+    count = s->ecc.count[area];
+    for (k = 0; k < 8; k++) {
+        b[k] = (din >> k) & 1;
+    }
+    s->ecc.cp[area] ^= (b[0] ^ b[2] ^ b[4] ^ b[6]) << 0;
+    s->ecc.cp[area] ^= (b[1] ^ b[3] ^ b[5] ^ b[7]) << 1;
+    s->ecc.cp[area] ^= (b[0] ^ b[1] ^ b[4] ^ b[5]) << 2;
+    s->ecc.cp[area] ^= (b[2] ^ b[3] ^ b[6] ^ b[7]) << 3;
+    s->ecc.cp[area] ^= (b[0] ^ b[1] ^ b[2] ^ b[3]) << 4;
+    s->ecc.cp[area] ^= (b[4] ^ b[5] ^ b[6] ^ b[7]) << 5;
+    if ((b[0] ^ b[1] ^ b[2] ^ b[3] ^ b[4] ^ b[5] ^ b[6] ^ b[7]) & 1) {
+        for (k = 0; k < 8; k++) {
+            s->ecc.lp[area] ^= ((count >> k) & 1) ? (1u << (2 * k + 1))
+                                                  : (1u << (2 * k));
+        }
+    }
+    s->ecc.count[area] = (count + 1) & 0xff;
+    s->ecc.pos++;
+}
+
 /*
  * Feed one byte into the NAND command/address/data state machine.
  * `command` is true when the CLE line is asserted, `address` when ALE is.
@@ -1102,6 +1152,9 @@ static uint64_t g9001_card_read_win(G9001State *s, G9001CardWin win,
         uint8_t v = 0xff;
 
         g9001_nand_byte(s, cle, ale, false, &v);
+        if (!cle && !ale && s->nand.phase == G9001_NAND_READ) {
+            g9001_ecc_byte(s, v);
+        }
         ret |= (uint64_t)v << (8 * i);
         if (win != G9001_CARD_WIN_4 && s->trace_nand_kernel &&
             g9001_knand_pc_wanted(s, g9001_current_pc()) &&
@@ -1151,6 +1204,9 @@ static void g9001_card_write_win(G9001State *s, G9001CardWin win,
                 (s->trace_nand_kernel_pc_min ? (1u << 20) : 4096)) {
             info_report("g9001-knand: wr win=%u cle=%d ale=%d val=0x%02x "
                         "pc=0x%08x", win, cle, ale, v, g9001_current_pc());
+        }
+        if (!cle && !ale && s->nand.phase == G9001_NAND_PROGRAM) {
+            g9001_ecc_byte(s, v);
         }
         g9001_nand_byte(s, cle, ale, true, &v);
     }
@@ -2199,14 +2255,15 @@ static uint64_t g9001_io_read(void *opaque, hwaddr offset, unsigned size)
         } else if (off >= G9001_IO_SPI_RXD && off < G9001_IO_SPI_RXD + 4) {
             v = (s->spi.rxd >> (8 * (off - G9001_IO_SPI_RXD))) & 0xff;
         } else if (off >= G9001_IO_ECC0_BASE &&
-                   off < G9001_IO_ECC0_BASE + ARRAY_SIZE(s->nand_ecc)) {
-            /*
-             * "ECC always correct": the byte the hardware would have computed
-             * over the last completed sector is exactly the one the flash
-             * stores for it, so echo that one back.
-             */
-            {
-                unsigned idx = off - G9001_IO_ECC0_BASE;
+                   off < G9001_IO_ECC0_BASE + 8) {
+            unsigned idx = off - G9001_IO_ECC0_BASE;
+
+            if (!s->ecc.gen) {
+                /*
+                 * Historic behaviour: echo the parity bytes stored with the
+                 * page so the firmware's comparison always succeeds.  It is
+                 * what every earlier test ran with, so it stays the default.
+                 */
                 unsigned area = s->nand.data_size +
                                 s->nand.ecc_sector * G9001_NAND_SECTOR_ECC +
                                 idx;
@@ -2219,7 +2276,34 @@ static uint64_t g9001_io_read(void *opaque, hwaddr offset, unsigned size)
                 } else {
                     v = s->nand_ecc[idx];
                 }
+            } else {
+                v = 0xff;
+                switch (idx) {
+            case 0:             /* pECC0CP  */
+                v = s->ecc.cp[0] & 0x3f;
+                break;
+            case 2:             /* pECC0LPL */
+                v = s->ecc.lp[0] & 0xff;
+                break;
+            case 3:             /* pECC0LPH */
+                v = s->ecc.lp[0] >> 8;
+                break;
+            case 4:             /* pECC1CP  */
+                v = s->ecc.cp[1] & 0x3f;
+                break;
+            case 6:             /* pECC1LPL */
+                v = s->ecc.lp[1] & 0xff;
+                break;
+            case 7:             /* pECC1LPH */
+                v = s->ecc.lp[1] >> 8;
+                break;
+            default:
+                break;
+                }
             }
+        } else if (off == G9001_IO_ECC_RSTRDY) {
+            /* both areas ready once a reset has been seen */
+            v = 0x03;
         } else if (off == G9001_IO_SDRAMC_INI) {
             /* The init bit and the ready/busy status bits are self-clearing
              * on real silicon; the boot loader polls bits 4 and 3 here. */
@@ -2295,7 +2379,10 @@ static void g9001_io_write(void *opaque, hwaddr offset, uint64_t value,
             s->io[off] &= ~v;
             break;
         case G9001_IO_ECC_RSTRDY:
-            s->io[off] = 0x01;          /* ECC ready */
+            s->io[off] = 0x03;          /* ECC ready, both areas */
+            if (v & 0x01) {
+                g9001_ecc_reset(s);
+            }
             break;
         case G9001_IO_INT_FK01_FP03:
         case G9001_IO_INT_F16T01:
@@ -2374,6 +2461,14 @@ static void g9001_io_write(void *opaque, hwaddr offset, uint64_t value,
             if (v & 0x40) {
                 g9001_hsdma_run(s);
             }
+            break;
+        case G9001_IO_ECC_ENA:
+            s->io[off] = v;
+            s->ecc.enabled = (v & 0x01) != 0;
+            break;
+        case G9001_IO_ECC_TRIGSEL:
+        case G9001_IO_ECC_MD:
+            s->io[off] = v;
             break;
         case G9001_IO_CARDSETUP:
             s->io[off] = v;
@@ -2683,6 +2778,7 @@ static void g9001_init(MachineState *machine)
     s->debug_boot_mode = gms->debug_boot_mode;
     s->nand_ecc_offset = gms->nand_ecc_offset;
     s->nand.ignore_ecc = gms->nand_ignore_ecc;
+    s->ecc.gen = gms->nand_ecc_gen;
     s->nand.spare_real = gms->nand_spare_real;
     s->nand.spare_stream = gms->nand_spare_stream;
     s->nand.spare_per_sector = gms->nand_spare_per_sector;
@@ -2973,6 +3069,16 @@ static void g9001_set_nand_ignore_ecc(Object *obj, bool value, Error **errp)
     G9001_MACHINE(obj)->nand_ignore_ecc = value;
 }
 
+static bool g9001_get_nand_ecc_gen(Object *obj, Error **errp)
+{
+    return G9001_MACHINE(obj)->nand_ecc_gen;
+}
+
+static void g9001_set_nand_ecc_gen(Object *obj, bool value, Error **errp)
+{
+    G9001_MACHINE(obj)->nand_ecc_gen = value;
+}
+
 static bool g9001_get_nand_spare_real(Object *obj, Error **errp)
 {
     return G9001_MACHINE(obj)->nand_spare_real;
@@ -3237,6 +3343,14 @@ static void g9001_machine_instance_init(Object *obj)
                                     "Return a blank (all-FF) spare area so the "
                                     "firmware software ECC check accepts every "
                                     "page");
+    object_property_add_bool(obj, "nand-ecc-gen",
+                             g9001_get_nand_ecc_gen,
+                             g9001_set_nand_ecc_gen);
+    object_property_set_description(obj, "nand-ecc-gen",
+                                    "Expose the ECC computed by the E08 "
+                                    "generator (manual V.4.6) in pECC0CP.. "
+                                    "pECC1LPH instead of echoing the stored "
+                                    "parity bytes");
     object_property_add_bool(obj, "nand-spare-real",
                              g9001_get_nand_spare_real,
                              g9001_set_nand_spare_real);
