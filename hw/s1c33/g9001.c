@@ -240,6 +240,7 @@ typedef struct G9001Nand {
     uint32_t data_end;
     unsigned ecc_sector;
     bool raw_stream;                /* reading the spare area directly */
+    bool large_page;                /* 5-cycle address: linear 2048+64 */
     bool program_loaded;
 } G9001Nand;
 
@@ -380,6 +381,8 @@ typedef struct G9001State {
     uint8_t irq_prio;
 
     uint64_t hsdma_copies;
+    uint32_t hsdma_last_ptr;
+    uint8_t hsdma_start_latch;
     bool hsdma_busy;
     QEMUTimer *dump_timer;
     bool dump_done;
@@ -620,6 +623,7 @@ static void g9001_nand_latch_addr(G9001State *s)
 {
     G9001Nand *n = &s->nand;
 
+    n->large_page = n->addr_count >= 5;
     switch (n->addr_count) {
     case 5:
         n->col = n->addr[0] | (n->addr[1] << 8);
@@ -673,6 +677,14 @@ static unsigned g9001_nand_sectors(const G9001Nand *n)
 
 static unsigned g9001_nand_stream_size(const G9001Nand *n)
 {
+    if (n->large_page) {
+        /* linear: 2048 data bytes followed by the 64-byte spare */
+        return n->page_size;
+    }
+    /*
+     * 512+16 small-page mode: each 512-byte sector is followed by its 8 ECC
+     * bytes, so the stream is 4 x 520 for a 2 KiB page.
+     */
     return g9001_nand_sectors(n) * G9001_NAND_SECTOR_STRIDE;
 }
 
@@ -681,8 +693,13 @@ static unsigned g9001_nand_stream_offset(const G9001Nand *n, unsigned pos)
     unsigned sector = pos / G9001_NAND_SECTOR_STRIDE;
     unsigned off = pos % G9001_NAND_SECTOR_STRIDE;
 
+    if (n->large_page) {
+        return pos < n->page_size ? pos : n->page_size;
+    }
     if (sector >= g9001_nand_sectors(n)) {
-        return g9001_nand_stream_size(n);
+        /* past the interleaved sectors: the raw spare area */
+        return n->data_size +
+               (pos - g9001_nand_sectors(n) * G9001_NAND_SECTOR_STRIDE);
     }
     if (off < G9001_NAND_SECTOR_DATA) {
         return sector * G9001_NAND_SECTOR_DATA + off;
@@ -1898,20 +1915,41 @@ static void g9001_hsdma_run(G9001State *s)
         return;
     }
     buf = g_malloc(count);
-    for (i = 0; i < count; i++) {
-        buf[i] = address_space_ldub(&address_space_memory,
-                                    (hwaddr)src + i, MEMTXATTRS_UNSPECIFIED,
-                                    NULL);
+    s->hsdma_last_ptr = s->nand.data_ptr;
+    if (src >= G9001_CARD11_BASE &&
+        src < G9001_CARD11_BASE + G9001_CARD11_SIZE) {
+        for (i = 0; i < count; i++) {
+            buf[i] = g9001_card_read_win(s, G9001_CARD_WIN_11,
+                                         (hwaddr)(src - G9001_CARD11_BASE) + i,
+                                         1);
+        }
+    } else if (src >= G9001_CARD4_BASE &&
+               src < G9001_CARD4_BASE + G9001_CARD4_SIZE) {
+        for (i = 0; i < count; i++) {
+            buf[i] = g9001_card_read_win(s, G9001_CARD_WIN_4,
+                                         (hwaddr)(src - G9001_CARD4_BASE) + i,
+                                         1);
+        }
+    } else {
+        for (i = 0; i < count; i++) {
+            buf[i] = address_space_ldub(&address_space_memory,
+                                        (hwaddr)src + i,
+                                        MEMTXATTRS_UNSPECIFIED, NULL);
+        }
     }
     address_space_write(&address_space_memory, (hwaddr)dst,
                         MEMTXATTRS_UNSPECIFIED, buf, count);
-    g_free(buf);
     s->io[G9001_IO_HS2_STAT] |= 0xc1;       /* done + enable */
     s->hsdma_copies++;
     if (s->trace_io) {
-        info_report("g9001-hsdma: copy %u bytes 0x%08x -> 0x%08x (row=%u col=%u)",
-                    count, src, dst, s->nand.row, s->nand.col);
+        info_report("g9001-hsdma: copy %u bytes 0x%08x -> 0x%08x (row=%u col=%u ptr %u->%u phase=%d) head=%02x %02x %02x %02x",
+                    count, src, dst, s->nand.row, s->nand.col,
+                    (unsigned)s->hsdma_last_ptr, (unsigned)s->nand.data_ptr,
+                    (int)s->nand.phase,
+                    count > 3 ? buf[0] : 0xff, count > 3 ? buf[1] : 0xff,
+                    count > 3 ? buf[2] : 0xff, count > 3 ? buf[3] : 0xff);
     }
+    g_free(buf);
 }
 
 static uint64_t g9001_io_read(void *opaque, hwaddr offset, unsigned size)
@@ -2104,10 +2142,13 @@ static void g9001_io_write(void *opaque, hwaddr offset, uint64_t value,
             break;
         case G9001_IO_HS2_STAT:
             s->io[off] = v;
-            if ((v & 0x40) && !(s->hsdma_busy)) {
-                s->hsdma_busy = true;
+            /*
+             * The firmware starts a transfer by setting bit 6.  Writing the
+             * register again with the bit still set must not start a second
+             * transfer, so trigger on the rising edge only.
+             */
+            if (v & 0x40) {
                 g9001_hsdma_run(s);
-                s->hsdma_busy = false;
             }
             break;
         case G9001_IO_CARDSETUP:
