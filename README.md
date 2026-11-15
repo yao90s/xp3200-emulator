@@ -157,7 +157,9 @@ bash scripts/xp3200/sd_image.sh create ~/card.img 128 "SD CARD" ~/音乐 ~/电�
 - GDB-RSP：`-gdb tcp::2349`，可下断点、单步、读写 guest 内存；
 - LCD 帧导出：`,debug-lcd-dump-path=<前缀>` + QMP `debug-lcd-dump-seq`；
 - 工厂自检菜单：按 `F12`（等价 `debug-call-addr=0x0217D6CE`）；
-- SD 热插拔：`,debug-sd-insert-ms=<毫秒>`。
+- SD 热插拔：`,debug-sd-insert-ms=<毫秒>`；
+- 软中断（`int`）跟踪：`-cpu c33l05,trace-int=on -d int`（默认关，只打
+  `s1c33-int:` 的向量地址/目标/PSR/TTBR；不开 `-d int` 时无输出、也无开销）。
 
 源码组织与阅读顺序见 [源码结构与阅读指南](docs/xp3200/source-guide.md)；
 更完整的调试记录与逆向过程见 [移植进度](docs/xp3200/progress.md)。
@@ -182,6 +184,11 @@ L05 是 28 位内部地址总线、TTBR bit31:28 固定 0；E08 保持完整 32 
 NAND=nand.img NOR=nor.bin bash scripts/xp3200/smoke.sh   # 主菜单/词典/返回
 NAND=g9001-nand.bin    bash scripts/g9001/smoke.sh      # 引导 + E08 OS 入口 + LCD
 ```
+
+`.github/workflows/smoke.yml` 在 Linux 上构建并检查 5 台机器；把镜像放到
+仓库变量 `XP3200_NAND_URL` / `XP3200_NOR_URL` / `G9001_NAND_URL` 后，两条冒烟也会
+在 CI 里跑。`g9001` 的 `slp-as-nop` 是机型属性（默认开），可用
+`-M g9001,slp-as-nop=off` 关掉。
 
 ## 代码结构
 
