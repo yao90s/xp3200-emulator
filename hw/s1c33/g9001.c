@@ -1939,15 +1939,22 @@ static void g9001_hsdma_run(G9001State *s)
     }
     address_space_write(&address_space_memory, (hwaddr)dst,
                         MEMTXATTRS_UNSPECIFIED, buf, count);
-    s->io[G9001_IO_HS2_STAT] |= 0xc1;       /* done + enable */
+    /*
+     * Completion clears the start/busy bit (6) and sets done (7): the firmware
+     * starts every transfer by writing bit 6 again, so a level trigger is
+     * correct only if the hardware clears it here.
+     */
+    s->io[G9001_IO_HS2_STAT] = 0x81;
     s->hsdma_copies++;
     if (s->trace_io) {
-        info_report("g9001-hsdma: copy %u bytes 0x%08x -> 0x%08x (row=%u col=%u ptr %u->%u phase=%d) head=%02x %02x %02x %02x",
+        info_report("g9001-hsdma: copy %u bytes 0x%08x -> 0x%08x (row=%u col=%u ptr %u->%u phase=%d) head=%02x %02x %02x %02x %02x %02x %02x %02x",
                     count, src, dst, s->nand.row, s->nand.col,
                     (unsigned)s->hsdma_last_ptr, (unsigned)s->nand.data_ptr,
                     (int)s->nand.phase,
                     count > 3 ? buf[0] : 0xff, count > 3 ? buf[1] : 0xff,
-                    count > 3 ? buf[2] : 0xff, count > 3 ? buf[3] : 0xff);
+                    count > 3 ? buf[2] : 0xff, count > 3 ? buf[3] : 0xff,
+                    count > 7 ? buf[4] : 0xff, count > 7 ? buf[5] : 0xff,
+                    count > 7 ? buf[6] : 0xff, count > 7 ? buf[7] : 0xff);
     }
     g_free(buf);
 }
