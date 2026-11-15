@@ -26,6 +26,7 @@ typedef struct DisasContext {
     uint32_t ttbr_mask;
     uint32_t addr_mask;
     bool slp_as_nop;
+    bool trace_int;
 } DisasContext;
 
 enum {
@@ -596,7 +597,9 @@ static void gen_software_interrupt(DisasContext *ctx, uint16_t word)
      */
     tcg_gen_andi_i32(cpu_psr, cpu_psr, ~S1C33_PSR_IE);
     gen_clear_ext(ctx);
-    gen_helper_s1c33_int_trace(tcg_env, vector_addr, target);
+    if (ctx->trace_int) {
+        gen_helper_s1c33_int_trace(tcg_env, vector_addr, target);
+    }
     tcg_gen_mov_i32(cpu_pc, target);
     tcg_gen_lookup_and_goto_ptr();
     ctx->base.is_jmp = DISAS_NORETURN;
@@ -1655,6 +1658,7 @@ void s1c33_translate_code(CPUState *cs, TranslationBlock *tb,
     dc.slp_as_nop = cpu->slp_as_nop;
     dc.ttbr_mask = s1c33_ttbr_mask(cpu->core_variant);
     dc.addr_mask = s1c33_addr_mask(cpu->core_variant);
+    dc.trace_int = cpu->trace_int;
     translator_loop(cs, tb, max_insns, pc, host_pc, &s1c33_tr_ops, &dc.base);
 }
 

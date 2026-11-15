@@ -124,6 +124,7 @@ static const Property s1c33_cpu_properties[] = {
     DEFINE_PROP_BOOL("trace-calls", S1C33CPU, trace_calls, false),
     DEFINE_PROP_BOOL("trace-exec", S1C33CPU, trace_exec, false),
     DEFINE_PROP_BOOL("trace-mem", S1C33CPU, trace_mem, false),
+    DEFINE_PROP_BOOL("trace-int", S1C33CPU, trace_int, false),
     DEFINE_PROP_UINT32("trace-calls-start", S1C33CPU, trace_calls_start, 0),
     DEFINE_PROP_UINT32("trace-calls-end", S1C33CPU, trace_calls_end, 0),
     DEFINE_PROP_UINT32("trace-exec-start", S1C33CPU, trace_exec_start, 0),

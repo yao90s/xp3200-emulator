@@ -99,6 +99,7 @@ struct ArchCPU {
     bool trace_calls;
     bool trace_exec;
     bool trace_mem;
+    bool trace_int;
     uint32_t trace_calls_start;
     uint32_t trace_calls_end;
     uint32_t trace_exec_start;

@@ -154,6 +154,9 @@ Implemented pieces:
   and returns with `RETI`.
 - Software interrupt (`INT imm`, opcode `04xx`) dispatches through
   `TTBR + 48 + (imm & 3) * 4` and **clears `PSR.IE`** on entry (manual behaviour).
+  `-cpu c33l05,trace-int=on -d int` additionally logs `s1c33-int:` with the
+  vector address, handler target, PSR, TTBR and SP (off by default; when off
+  the translator does not even emit the helper call).
 - Trap-table base and indirect jump targets are **core dependent**: the L05
   keeps a 28-bit internal address bus (`TTBR` bits 31:28 read as zero), the
   E08 keeps the full 32-bit address (its SDRAM sits at `0x10000000` and the

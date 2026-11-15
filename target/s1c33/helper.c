@@ -218,7 +218,7 @@ void helper_s1c33_trace_branch(CPUS1C33State *env, uint32_t kind,
 void helper_s1c33_int_trace(CPUS1C33State *env, uint32_t vector_addr,
                             uint32_t target)
 {
-    qemu_log_mask(LOG_GUEST_ERROR,
+    qemu_log_mask(CPU_LOG_INT,
                   "s1c33-int: psr=0x%08x ttbr=0x%08x vector_addr=0x%08x "
                   "target=0x%08x sp=0x%08x\n",
                   env->psr, env->ttbr, vector_addr, target, env->sp);
