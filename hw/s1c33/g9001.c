@@ -265,6 +265,10 @@ typedef struct G9001MachineState {
     uint32_t debug_key_row;         /* held key row */
     uint32_t debug_gpio_low_port;   /* port whose inputs are forced */
     uint32_t debug_gpio_low_mask;
+    uint32_t debug_dump_addr;
+    uint32_t debug_dump_size;
+    uint32_t debug_dump_ms;
+    char *debug_dump_path;
     char *spi_image_path;
     char *mmc_cid_hex;
     char *mmc_csd_hex;
@@ -377,6 +381,8 @@ typedef struct G9001State {
 
     uint64_t hsdma_copies;
     bool hsdma_busy;
+    QEMUTimer *dump_timer;
+    bool dump_done;
 
     /* SPI + MMC card */
     G9001Spi spi;
@@ -1172,6 +1178,36 @@ static const GraphicHwOps g9001_lcd_ops = {
     .gfx_update = g9001_lcd_update,
 };
 
+static void g9001_mem_dump(void *opaque)
+{
+    G9001State *s = opaque;
+    G9001MachineState *gms = G9001_MACHINE(s->machine);
+    uint8_t *buf;
+    int fd;
+
+    if (s->dump_done || gms->debug_dump_path == NULL || gms->debug_dump_size == 0) {
+        return;
+    }
+    s->dump_done = true;
+    buf = g_malloc0(gms->debug_dump_size);
+    address_space_read(&address_space_memory, (hwaddr)gms->debug_dump_addr,
+                       MEMTXATTRS_UNSPECIFIED, buf, gms->debug_dump_size);
+    fd = open(gms->debug_dump_path, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY,
+              0644);
+    if (fd < 0) {
+        error_report("g9001: cannot write memory dump '%s': %s",
+                     gms->debug_dump_path, strerror(errno));
+    } else {
+        ssize_t wrote = write(fd, buf, gms->debug_dump_size);
+
+        close(fd);
+        info_report("g9001: dumped %u bytes at 0x%08x to %s (%zd written)",
+                    gms->debug_dump_size, gms->debug_dump_addr,
+                    gms->debug_dump_path, wrote);
+    }
+    g_free(buf);
+}
+
 static void g9001_lcd_dump_pgm(G9001State *s, const char *path)
 {
     const uint8_t *vram = g9001_lcd_vram(s);
@@ -1873,8 +1909,8 @@ static void g9001_hsdma_run(G9001State *s)
     s->io[G9001_IO_HS2_STAT] |= 0xc1;       /* done + enable */
     s->hsdma_copies++;
     if (s->trace_io) {
-        info_report("g9001-hsdma: copy %u bytes 0x%08x -> 0x%08x", count, src,
-                    dst);
+        info_report("g9001-hsdma: copy %u bytes 0x%08x -> 0x%08x (row=%u col=%u)",
+                    count, src, dst, s->nand.row, s->nand.col);
     }
 }
 
@@ -2348,6 +2384,12 @@ static void g9001_init(MachineState *machine)
     }
     s->spi.ctl1 = 7u << G9001_SPI_CTL1_BPT_SHIFT;   /* 8-bit transfers */
     g9001_mmc_open(s, gms->spi_image_path);
+    if (gms->debug_dump_path != NULL && gms->debug_dump_size != 0) {
+        s->dump_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, g9001_mem_dump, s);
+        timer_mod(s->dump_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                  (gms->debug_dump_ms ? gms->debug_dump_ms : 1000));
+    }
     if (gms->debug_spi_test) {
         g9001_spi_selftest(s);
     }
@@ -2546,6 +2588,19 @@ static void g9001_set_nand_save(Object *obj, bool value, Error **errp)
     G9001_MACHINE(obj)->nand_save = value;
 }
 
+static char *g9001_get_dump_path(Object *obj, Error **errp)
+{
+    return g_strdup(G9001_MACHINE(obj)->debug_dump_path);
+}
+
+static void g9001_set_dump_path(Object *obj, const char *value, Error **errp)
+{
+    G9001MachineState *gms = G9001_MACHINE(obj);
+
+    g_free(gms->debug_dump_path);
+    gms->debug_dump_path = g_strdup(value);
+}
+
 static char *g9001_get_spi_image(Object *obj, Error **errp)
 {
     return g_strdup(G9001_MACHINE(obj)->spi_image_path);
@@ -2637,6 +2692,8 @@ static void g9001_machine_instance_init(Object *obj)
     gms->nand_ryby_pin = 4 * 8 + 0; /* P4.0 = RY/#BY */
     gms->debug_gpio_low_port = 0xffffffff;
     gms->mmc_capacity_mb = 128;
+    gms->debug_dump_addr = 0x10000000;
+    gms->debug_dump_ms = 1000;
     gms->debug_gpio_low_mask = 0;
     gms->debug_key_col = 0xffffffff;
     gms->debug_key_row = 0xffffffff;
@@ -2713,6 +2770,25 @@ static void g9001_machine_instance_init(Object *obj)
     object_property_set_description(obj, "debug-boot-mode",
                                     "Byte left at A0RAM 0x221 for the second "
                                     "stage (0x400d48 compares it with 1)");
+    object_property_add_uint32_ptr(obj, "debug-dump-mem-addr",
+                                   &gms->debug_dump_addr,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "debug-dump-mem-addr",
+                                    "Guest physical address for a memory dump");
+    object_property_add_uint32_ptr(obj, "debug-dump-mem-size",
+                                   &gms->debug_dump_size,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "debug-dump-mem-size",
+                                    "Bytes to dump (0 disables the dump)");
+    object_property_add_uint32_ptr(obj, "debug-dump-mem-ms",
+                                   &gms->debug_dump_ms,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "debug-dump-mem-ms",
+                                    "Dump the memory after this many ms");
+    object_property_add_str(obj, "debug-dump-mem-path",
+                            g9001_get_dump_path, g9001_set_dump_path);
+    object_property_set_description(obj, "debug-dump-mem-path",
+                                    "File that receives the memory dump");
     object_property_add_str(obj, "spi-image",
                             g9001_get_spi_image, g9001_set_spi_image);
     object_property_set_description(obj, "spi-image",
