@@ -733,8 +733,8 @@ static void g9001_nand_latch_addr(G9001State *s)
     }
     if ((s->trace_nand || s->trace_nand_latch) && n->addr_count) {
         info_report("g9001-nand: latch %u bytes -> col=%u row=%u "
-                    "(byte offset %" PRIu64 ")",
-                    n->addr_count, n->col, n->row,
+                    "pc=0x%08x (byte offset %" PRIu64 ")",
+                    n->addr_count, n->col, n->row, g9001_current_pc(),
                     (uint64_t)n->row * G9001_NAND_RAW_PAGE + n->col);
     }
     n->addr_count = 0;
