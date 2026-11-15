@@ -849,9 +849,14 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
             n->phase = G9001_NAND_READ;
         }
     }
-    if ((n->data_ptr % G9001_NAND_SECTOR_STRIDE) ==
-        G9001_NAND_SECTOR_DATA) {
-        n->ecc_sector = n->data_ptr / G9001_NAND_SECTOR_STRIDE;
+    /*
+     * The ECC registers always show the sector the data pointer is in, so
+     * update it on every access rather than only at sector boundaries.
+     */
+    if (g9001_nand_sectors(n) != 0) {
+        unsigned sec = n->data_ptr / G9001_NAND_SECTOR_STRIDE;
+
+        n->ecc_sector = MIN(sec, g9001_nand_sectors(n) - 1);
     }
 
     switch (n->phase) {
@@ -2002,7 +2007,19 @@ static uint64_t g9001_io_read(void *opaque, hwaddr offset, unsigned size)
              * over the last completed sector is exactly the one the flash
              * stores for it, so echo that one back.
              */
-            v = s->nand_ecc[off - G9001_IO_ECC0_BASE];
+            {
+                unsigned idx = off - G9001_IO_ECC0_BASE;
+                unsigned area = s->nand.data_size +
+                                s->nand.ecc_sector * G9001_NAND_SECTOR_ECC +
+                                idx;
+
+                if (s->nand.cached_page >= 0 &&
+                    area < s->nand.page_size) {
+                    v = s->nand.page[area];
+                } else {
+                    v = s->nand_ecc[idx];
+                }
+            }
         } else if (off == G9001_IO_SDRAMC_INI) {
             /* The init bit and the ready/busy status bits are self-clearing
              * on real silicon; the boot loader polls bits 4 and 3 here. */
