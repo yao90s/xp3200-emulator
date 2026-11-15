@@ -1481,15 +1481,7 @@ static uint64_t g9001_io_read(void *opaque, hwaddr offset, unsigned size)
              * over the last completed sector is exactly the one the flash
              * stores for it, so echo that one back.
              */
-            unsigned idx = off - G9001_IO_ECC0_BASE;
-            unsigned area = G9001_NAND_ECC_AREA +
-                            s->nand.ecc_sector * G9001_NAND_SECTOR_ECC + idx;
-
-            if (s->nand.cached_page >= 0 && area < sizeof(s->nand.page)) {
-                v = s->nand.page[area];
-            } else {
-                v = s->nand_ecc[idx];
-            }
+            v = s->nand_ecc[off - G9001_IO_ECC0_BASE];
         } else if (off == G9001_IO_SDRAMC_INI) {
             /* The init bit and the ready/busy status bits are self-clearing
              * on real silicon; the boot loader polls bits 4 and 3 here. */
