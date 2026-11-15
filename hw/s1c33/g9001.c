@@ -246,6 +246,7 @@ typedef struct G9001Nand {
     bool ignore_ecc;                /* report a blank (all-FF) spare */
     bool spare_real;                /* direct spare reads bypass ignore_ecc */
     bool program_loaded;
+    GHashTable *written;            /* page -> programmed bytes (RAM overlay) */
 
     /*
      * The dump skipped the chip's bad blocks, so the firmware's physical block
@@ -388,6 +389,7 @@ typedef struct G9001State {
     uint32_t lcd_present_seq;
     int64_t lcd_last_dump;
     uint32_t nand_max_row;          /* highest page row the firmware read */
+    uint64_t nand_programs;         /* pages the firmware programmed */
 
     /* NAND */
     G9001Nand nand;
@@ -562,6 +564,10 @@ static bool g9001_nand_open(G9001State *s, const char *path)
 
 static void g9001_nand_close(G9001State *s)
 {
+    if (s->nand.written != NULL) {
+        g_hash_table_destroy(s->nand.written);
+        s->nand.written = NULL;
+    }
     if (s->nand.fd >= 0) {
         close(s->nand.fd);
         s->nand.fd = -1;
@@ -605,6 +611,7 @@ static bool g9001_nand_load_page(G9001State *s, uint32_t row)
     ssize_t got;
     uint32_t page;
     bool bad;
+    const uint8_t *ov;
 
     page = g9001_nand_xlate(s, row, &bad);
     if (bad) {
@@ -613,6 +620,22 @@ static bool g9001_nand_load_page(G9001State *s, uint32_t row)
         return false;
     }
     if (n->cached_page == (int64_t)page) {
+        return true;
+    }
+    /*
+     * The firmware programs the block map back onto the card and then reads it
+     * again.  Writes are kept in a RAM overlay so the image file stays
+     * untouched unless nand-save is on.
+     */
+    ov = n->written != NULL ? g_hash_table_lookup(n->written,
+                                                  GUINT_TO_POINTER(page + 1))
+                            : NULL;
+    if (ov != NULL) {
+        memcpy(n->page, ov, n->page_size);
+        n->cached_page = page;
+        n->page_dirty = false;
+        memcpy(s->nand_ecc, n->page + n->page_size - sizeof(s->nand_ecc),
+               sizeof(s->nand_ecc));
         return true;
     }
     if (n->fd < 0) {
@@ -665,6 +688,13 @@ static void g9001_nand_store_page(G9001State *s)
 
         (void)wrote;
     }
+    if (n->written == NULL) {
+        n->written = g_hash_table_new_full(g_direct_hash, g_direct_equal,
+                                           NULL, g_free);
+    }
+    s->nand_programs++;
+    g_hash_table_replace(n->written, GUINT_TO_POINTER(n->cached_page + 1),
+                         g_memdup2(n->page, n->page_size));
     n->page_dirty = false;
 }
 
@@ -1467,8 +1497,8 @@ static void g9001_pc_sample_cb(void *opaque)
 
     info_report("g9001-pc: pc=0x%08x sp=0x%08x psr=0x%08x ttbr=0x%08x "
                 "lcd_ps=0x%02x madd=0x%08x disp=0x%08x a0221=0x%02x "
-                "a03f3=0x%02x card=%" PRIu64 "/%" PRIu64 " maxrow=%u "
-                "t16(ctl=0x%02x "
+                "a03f3=0x%02x card=%" PRIu64 "/%" PRIu64 " maxrow=%u prog=%" PRIu64
+                " t16(ctl=0x%02x "
                 "cnt=%u ca=%u cb=%u ie=0x%02x il=0x%02x fl=0x%02x)",
                 g9001_current_pc(), s->cpu->env.sp, s->cpu->env.psr,
                 s->cpu->env.ttbr, s->io[G9001_IO_LCDC_PS],
@@ -1477,6 +1507,7 @@ static void g9001_pc_sample_cb(void *opaque)
                 s->a0ram_ptr != NULL ? s->a0ram_ptr[0x221] : 0,
                 s->a0ram_ptr != NULL ? s->a0ram_ptr[0x3f3] : 0,
                 s->card_reads, s->card_writes, s->nand_max_row,
+                s->nand_programs,
                 s->t16.ctl, s->t16.counter, s->t16.ca, s->t16.cb,
                 s->io[G9001_IO_INT_E16T01], s->io[0x0266],
                 s->io[0x0282]);
