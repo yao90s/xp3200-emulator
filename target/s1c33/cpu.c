@@ -15,6 +15,7 @@
 #include "exec/target_page.h"
 #include "exec/translation-block.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/core/qdev.h"
 #include "tcg/debug-assert.h"
 #include "accel/tcg/cpu-ops.h"
 
@@ -118,6 +119,7 @@ static const Property s1c33_cpu_properties[] = {
     DEFINE_PROP_BOOL("shutdown-on-disabled-halt", S1C33CPU,
                      shutdown_on_disabled_halt, false),
     DEFINE_PROP_BOOL("slp-as-nop", S1C33CPU, slp_as_nop, false),
+    DEFINE_PROP_UINT32("core-variant", S1C33CPU, core_variant, S1C33_CORE_L05),
     DEFINE_PROP_BOOL("trace-psr", S1C33CPU, trace_psr, false),
     DEFINE_PROP_BOOL("trace-calls", S1C33CPU, trace_calls, false),
     DEFINE_PROP_BOOL("trace-exec", S1C33CPU, trace_exec, false),
@@ -200,7 +202,8 @@ static void s1c33_cpu_enter_trap(CPUState *cs, const char *name,
     uint32_t vector_addr;
     uint32_t handler;
 
-    vector_addr = (env->ttbr & S1C33_TTBR_MASK) + vector * 4;
+    vector_addr = (env->ttbr & s1c33_ttbr_mask(S1C33_CPU(cs)->core_variant)) +
+                  vector * 4;
     if (!s1c33_cpu_load_u32(cs, vector_addr, &handler)) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "s1c33: %s vector read failed ttbr=0x%08x "
@@ -237,8 +240,9 @@ static void s1c33_cpu_enter_trap(CPUState *cs, const char *name,
     qemu_log_mask(CPU_LOG_INT,
                   "s1c33: %s vector=%u level=%u table=0x%08x "
                   "handler=0x%08x old_pc=0x%08x old_psr=0x%08x sp=0x%08x\n",
-                  name, vector, level, env->ttbr & S1C33_TTBR_MASK, env->pc,
-                  old_pc, old_psr, env->sp);
+                  name, vector, level,
+                  env->ttbr & s1c33_ttbr_mask(S1C33_CPU(cs)->core_variant),
+                  env->pc, old_pc, old_psr, env->sp);
 }
 
 void s1c33_cpu_do_interrupt(CPUState *cs)
@@ -382,3 +386,22 @@ static const TypeInfo s1c33_cpu_type_info[] = {
 };
 
 DEFINE_TYPES(s1c33_cpu_type_info)
+
+/*
+ * Create and realize the CPU with its core variant already selected.  This
+ * has to happen before realize(): "core-variant" is a qdev property and
+ * cannot be changed afterwards, and machines cannot express it through
+ * machine->cpu_type.
+ */
+CPUState *s1c33_cpu_create(const char *typename, uint32_t core_variant,
+                           bool slp_as_nop)
+{
+    CPUState *cpu = CPU(object_new(typename));
+
+    object_property_set_uint(OBJECT(cpu), "core-variant", core_variant,
+                             &error_fatal);
+    object_property_set_bool(OBJECT(cpu), "slp-as-nop", slp_as_nop,
+                             &error_fatal);
+    qdev_realize(DEVICE(cpu), NULL, &error_fatal);
+    return cpu;
+}

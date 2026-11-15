@@ -1111,7 +1111,7 @@ static uint32_t bbk9288s_ttbr_from_regs(BBK9288SState *s)
 
 static void bbk9288s_set_ttbr(BBK9288SState *s, uint32_t value)
 {
-    uint32_t ttbr = value & S1C33_TTBR_MASK;
+    uint32_t ttbr = value & S1C33_TTBR_MASK_L05;
 
     s->io_regs[BBK9288S_TTBR_OFFSET + 0] = ttbr & 0xff;
     s->io_regs[BBK9288S_TTBR_OFFSET + 1] = (ttbr >> 8) & 0xff;

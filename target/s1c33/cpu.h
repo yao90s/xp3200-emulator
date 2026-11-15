@@ -31,9 +31,36 @@ enum {
 #define S1C33_PSR_MO         (1u << 7)
 #define S1C33_PSR_IL_SHIFT   8
 #define S1C33_PSR_IL_MASK    (0xfu << S1C33_PSR_IL_SHIFT)
-/* Trap table base: 1 KiB aligned.  Keep the high bits - the E08 maps SDRAM
- * up to 0x12000000 and the firmware installs its own table at 0x11e84000. */
-#define S1C33_TTBR_MASK      0xfffffc00u
+/*
+ * Trap table base is 1 KiB aligned: bits 9..0 read back as zero on both
+ * cores.  They differ above that - the L05 keeps bits 31..28 at zero and
+ * has a 28-bit internal address bus, while the E08 keeps the full 32-bit
+ * address (its SDRAM sits at 0x10000000 and the firmware installs the trap
+ * table at 0x11e84000).  The variant is picked per CPU model through the
+ * "core-variant" property, so a machine change cannot silently alter the
+ * address semantics of the other core.
+ */
+typedef enum S1C33CoreVariant {
+    S1C33_CORE_L05 = 0,
+    S1C33_CORE_E08 = 1,
+} S1C33CoreVariant;
+
+#define S1C33_TTBR_MASK_L05  0x0ffffc00u
+#define S1C33_TTBR_MASK_E08  0xfffffc00u
+#define S1C33_ADDR_MASK_L05  0x0ffffffeu
+#define S1C33_ADDR_MASK_E08  0xfffffffeu
+
+static inline uint32_t s1c33_ttbr_mask(uint32_t core_variant)
+{
+    return core_variant == S1C33_CORE_E08 ? S1C33_TTBR_MASK_E08
+                                          : S1C33_TTBR_MASK_L05;
+}
+
+static inline uint32_t s1c33_addr_mask(uint32_t core_variant)
+{
+    return core_variant == S1C33_CORE_E08 ? S1C33_ADDR_MASK_E08
+                                          : S1C33_ADDR_MASK_L05;
+}
 #define S1C33_TRAP_NMI_VECTOR 7
 #define S1C33_CPU_INTERRUPT_NMI CPU_INTERRUPT_TGT_EXT_3
 
@@ -66,6 +93,7 @@ struct ArchCPU {
 
     bool exit_on_halt;
     bool shutdown_on_disabled_halt;
+    uint32_t core_variant;          /* S1C33CoreVariant */
     bool slp_as_nop;
     bool trace_psr;
     bool trace_calls;
@@ -104,6 +132,8 @@ int s1c33_cpu_gdb_write_register(CPUState *cpu, uint8_t *buf, int reg);
 int print_insn_s1c33(bfd_vma addr, disassemble_info *info);
 
 void s1c33_translate_init(void);
+CPUState *s1c33_cpu_create(const char *typename, uint32_t core_variant,
+                           bool slp_as_nop);
 void s1c33_translate_code(CPUState *cs, TranslationBlock *tb,
                           int *max_insns, vaddr pc, void *host_pc);
 

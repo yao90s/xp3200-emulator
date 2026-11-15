@@ -23,6 +23,8 @@ typedef struct DisasContext {
     uint32_t pc;
     uint16_t ext[2];
     unsigned ext_count;
+    uint32_t ttbr_mask;
+    uint32_t addr_mask;
     bool slp_as_nop;
 } DisasContext;
 
@@ -585,7 +587,7 @@ static void gen_software_interrupt(DisasContext *ctx, uint16_t word)
                         cpu_sp, 0, MO_LEUL);
     tcg_gen_subi_i32(cpu_sp, cpu_sp, 4);
     tcg_gen_qemu_st_i32(old_psr, cpu_sp, 0, MO_LEUL);
-    tcg_gen_andi_i32(vector_addr, cpu_ttbr, S1C33_TTBR_MASK);
+    tcg_gen_andi_i32(vector_addr, cpu_ttbr, ctx->ttbr_mask);
     tcg_gen_addi_i32(vector_addr, vector_addr, vector_offset);
     tcg_gen_qemu_ld_i32(target, vector_addr, 0, MO_LEUL);
     /*
@@ -663,11 +665,11 @@ static void gen_register_call_or_jump(DisasContext *ctx, uint16_t word,
     TCGv_i32 target = tcg_temp_new_i32();
 
     /*
-     * Only align the target: the E08 maps SDRAM up to 0x12000000, so a
-     * 28-bit mask here would silently truncate every indirect jump into
-     * the loaded OS.
+     * The target is only aligned to a halfword; how many address bits
+     * survive is a property of the core (L05: 28-bit internal bus, E08:
+     * full 32-bit, needed to reach its SDRAM above 0x10000000).
      */
-    tcg_gen_andi_i32(target, cpu_regs[rb], 0xfffffffeu);
+    tcg_gen_andi_i32(target, cpu_regs[rb], ctx->addr_mask);
     gen_clear_ext(ctx);
 
     if (call) {
@@ -733,7 +735,7 @@ static void gen_ld_reg_to_special(DisasContext *ctx, uint16_t word)
     } else {
         tcg_gen_mov_i32(dst, cpu_regs[rs]);
         if (sd == 8) {
-            tcg_gen_andi_i32(cpu_ttbr, cpu_ttbr, S1C33_TTBR_MASK);
+            tcg_gen_andi_i32(cpu_ttbr, cpu_ttbr, ctx->ttbr_mask);
         }
     }
     gen_clear_ext(ctx);
@@ -1647,9 +1649,12 @@ static const TranslatorOps s1c33_tr_ops = {
 void s1c33_translate_code(CPUState *cs, TranslationBlock *tb,
                           int *max_insns, vaddr pc, void *host_pc)
 {
+    S1C33CPU *cpu = S1C33_CPU(cs);
     DisasContext dc = { };
 
-    dc.slp_as_nop = S1C33_CPU(cs)->slp_as_nop;
+    dc.slp_as_nop = cpu->slp_as_nop;
+    dc.ttbr_mask = s1c33_ttbr_mask(cpu->core_variant);
+    dc.addr_mask = s1c33_addr_mask(cpu->core_variant);
     translator_loop(cs, tb, max_insns, pc, host_pc, &s1c33_tr_ops, &dc.base);
 }
 

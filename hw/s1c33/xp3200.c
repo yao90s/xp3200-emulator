@@ -1385,7 +1385,7 @@ static uint32_t xp3200s_ttbr_from_regs(XP3200SState *s)
 
 static void xp3200s_set_ttbr(XP3200SState *s, uint32_t value)
 {
-    uint32_t ttbr = value & S1C33_TTBR_MASK;
+    uint32_t ttbr = value & S1C33_TTBR_MASK_L05;
 
     s->io_regs[XP3200S_TTBR_OFFSET + 0] = ttbr & 0xff;
     s->io_regs[XP3200S_TTBR_OFFSET + 1] = (ttbr >> 8) & 0xff;

@@ -23,6 +23,7 @@
 #include "hw/core/loader.h"
 #include "system/address-spaces.h"
 #include "system/memory.h"
+#include "system/runstate.h"
 #include "system/system.h"
 #include "qemu/timer.h"
 #include "ui/console.h"
@@ -2321,7 +2322,6 @@ static void g9001_boot_from_nand(G9001State *s)
     G9001MachineState *gms;
     uint8_t *rom;
     unsigned config;
-    uint32_t boot_pc = 0;
 
     if (s->machine == NULL) {
         return;
@@ -2589,17 +2589,18 @@ static void g9001_init(MachineState *machine)
     s->con = graphic_console_init(NULL, 0, &g9001_lcd_ops, s);
     qemu_console_resize(s->con, G9001_LCD_WIDTH, G9001_LCD_HEIGHT);
 
-    cpu = S1C33_CPU(cpu_create(machine->cpu_type));
+    /*
+     * core-variant = E08 keeps the full 32-bit trap-table/jump address (its
+     * SDRAM sits above 0x10000000), unlike the L05's 28-bit internal bus.
+     * slp-as-nop: the boot loader and the OS use SLP as a short "clock unit
+     * settled" delay while PSR.IE is clear, so nothing could ever wake the
+     * CPU in the model.  Both are forced on for this machine; the -cpu
+     * properties cannot override them because the CPU is realized here.
+     */
+    cpu = S1C33_CPU(s1c33_cpu_create(machine->cpu_type, S1C33_CORE_E08, true));
     s->cpu = cpu;
     s->cpu->env.sp = G9001_BOOT_STACK_TOP;
     s->cpu->env.ttbr = 0;
-
-    /*
-     * The boot loader and the OS use SLP as a short "clock unit settled"
-     * delay while PSR.IE is clear, so nothing could ever wake the CPU in the
-     * model.  Treat SLP as a NOP; override with -cpu c33l05,slp-as-nop=off.
-     */
-    cpu->slp_as_nop = true;
 
     s->kbd_handler = qemu_input_handler_register(NULL,
                                                  &g9001_keyboard_handler);
