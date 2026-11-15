@@ -241,6 +241,7 @@ typedef struct G9001Nand {
     unsigned ecc_sector;
     bool raw_stream;                /* reading the spare area directly */
     bool large_page;                /* 5-cycle address: linear 2048+64 */
+    bool ignore_ecc;                /* report a blank (all-FF) spare */
     bool program_loaded;
 } G9001Nand;
 
@@ -283,6 +284,7 @@ typedef struct G9001MachineState {
     uint32_t nand_ryby_pin;
     uint32_t nand_ecc_offset;
     bool nand_kernel_4k;
+    bool nand_ignore_ecc;
 } G9001MachineState;
 
 typedef struct G9001T16 {
@@ -870,10 +872,16 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
         if (n->raw_stream) {
             *value = n->data_ptr < sizeof(n->page) ? n->page[n->data_ptr] :
                      0xff;
+            if (n->ignore_ecc && n->data_ptr >= n->data_size) {
+                *value = 0xff;
+            }
             n->data_ptr++;
         } else if (n->data_ptr < g9001_nand_stream_size(n)) {
             off = g9001_nand_stream_offset(n, n->data_ptr);
             *value = off < sizeof(n->page) ? n->page[off] : 0xff;
+            if (n->ignore_ecc && off >= n->data_size) {
+                *value = 0xff;
+            }
             n->data_ptr++;
         } else {
             *value = 0xff;
@@ -2043,8 +2051,10 @@ static uint64_t g9001_io_read(void *opaque, hwaddr offset, unsigned size)
                                 s->nand.ecc_sector * G9001_NAND_SECTOR_ECC +
                                 idx;
 
-                if (s->nand.cached_page >= 0 &&
-                    area < s->nand.page_size) {
+                if (s->nand.ignore_ecc) {
+                    v = 0xff;
+                } else if (s->nand.cached_page >= 0 &&
+                           area < s->nand.page_size) {
                     v = s->nand.page[area];
                 } else {
                     v = s->nand_ecc[idx];
@@ -2511,6 +2521,7 @@ static void g9001_init(MachineState *machine)
     s->debug_usbctl = gms->debug_usbctl;
     s->debug_boot_mode = gms->debug_boot_mode;
     s->nand_ecc_offset = gms->nand_ecc_offset;
+    s->nand.ignore_ecc = gms->nand_ignore_ecc;
 
     memory_region_init_ram(&s->a0ram, NULL, "g9001.a0ram",
                            G9001_A0RAM_SIZE, &error_fatal);
@@ -2752,6 +2763,16 @@ static void g9001_set_spi_test(Object *obj, bool value, Error **errp)
     G9001_MACHINE(obj)->debug_spi_test = value;
 }
 
+static bool g9001_get_nand_ignore_ecc(Object *obj, Error **errp)
+{
+    return G9001_MACHINE(obj)->nand_ignore_ecc;
+}
+
+static void g9001_set_nand_ignore_ecc(Object *obj, bool value, Error **errp)
+{
+    G9001_MACHINE(obj)->nand_ignore_ecc = value;
+}
+
 static bool g9001_get_kernel_4k(Object *obj, Error **errp)
 {
     return G9001_MACHINE(obj)->nand_kernel_4k;
@@ -2794,6 +2815,7 @@ static void g9001_machine_instance_init(Object *obj)
     gms->nand_ryby_pin = 4 * 8 + 0; /* P4.0 = RY/#BY */
     gms->debug_gpio_low_port = 0xffffffff;
     gms->mmc_capacity_mb = 128;
+    gms->nand_ignore_ecc = true;
     gms->debug_dump_addr = 0x10000000;
     gms->debug_dump_ms = 1000;
     gms->debug_gpio_low_mask = 0;
@@ -2939,6 +2961,13 @@ static void g9001_machine_instance_init(Object *obj)
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_set_description(obj, "debug-key-row",
                                     "Hold a key down: matrix row (0..7)");
+    object_property_add_bool(obj, "nand-ignore-ecc",
+                             g9001_get_nand_ignore_ecc,
+                             g9001_set_nand_ignore_ecc);
+    object_property_set_description(obj, "nand-ignore-ecc",
+                                    "Return a blank (all-FF) spare area so the "
+                                    "firmware software ECC check accepts every "
+                                    "page");
     object_property_add_bool(obj, "nand-kernel-4k",
                              g9001_get_kernel_4k, g9001_set_kernel_4k);
     object_property_set_description(obj, "nand-kernel-4k",
