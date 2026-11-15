@@ -211,6 +211,7 @@ typedef enum G9001NandPhase {
     G9001_NAND_ERASE,
     G9001_NAND_STATUS,
     G9001_NAND_ID,
+    G9001_NAND_RANDOM_COL,          /* 0x05: two column bytes, then 0xE0 */
 } G9001NandPhase;
 
 typedef struct G9001Nand {
@@ -243,6 +244,7 @@ typedef struct G9001Nand {
     bool raw_stream;                /* reading the spare area directly */
     bool large_page;                /* 5-cycle address: linear 2048+64 */
     bool ignore_ecc;                /* report a blank (all-FF) spare */
+    bool spare_real;                /* direct spare reads bypass ignore_ecc */
     bool program_loaded;
 } G9001Nand;
 
@@ -259,6 +261,7 @@ typedef struct G9001MachineState {
     bool trace_io;
     bool trace_nand;
     bool trace_nand_kernel;
+    uint32_t trace_nand_kernel_pc_min;
     bool trace_irq;
     uint32_t t16_hz;
     uint32_t debug_p1_low_mask;     /* force P1 input bits low */
@@ -286,6 +289,7 @@ typedef struct G9001MachineState {
     uint32_t nand_ecc_offset;
     bool nand_kernel_4k;
     bool nand_ignore_ecc;
+    bool nand_spare_real;
     bool slp_as_nop;                /* treat SLP as NOP (default on) */
 } G9001MachineState;
 
@@ -358,6 +362,7 @@ typedef struct G9001State {
     bool trace_io;
     bool trace_nand;
     bool trace_nand_kernel;
+    uint32_t trace_nand_kernel_pc_min;
     bool trace_irq;
     uint32_t debug_p1_low_mask;
     uint32_t debug_usbctl;
@@ -459,6 +464,21 @@ static uint32_t g9001_current_pc(void)
         return 0;
     }
     return g9001_active->cpu->env.pc;
+}
+
+/*
+ * trace-nand-kernel normally logs the first 4096 accesses of each window, which
+ * is used up long before the firmware OS runs.  A pc-min filter makes the tail
+ * of the boot inspectable: low-RAM helpers (A0RAM/IVRAM, pc < 0x10000) are
+ * always logged because the firmware keeps its NAND byte routines there, while
+ * higher pcs only count once they reach the configured minimum.
+ */
+static bool g9001_knand_pc_wanted(G9001State *s, uint32_t pc)
+{
+    if (s->trace_nand_kernel_pc_min == 0) {
+        return true;
+    }
+    return pc < 0x10000 || pc >= s->trace_nand_kernel_pc_min;
 }
 
 static void g9001_trace_push(G9001State *s, uint16_t offset, unsigned size,
@@ -790,6 +810,26 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
             n->phase = G9001_NAND_ID;
             n->id_ptr = 0;
             break;
+        case 0x05:
+            /*
+             * Random data output ("column change"): the next two address
+             * cycles are a column, and 0xE0 confirms.  The page stays loaded;
+             * only the read pointer moves.  The firmware OS uses this after a
+             * sequential read to get back to the spare area.
+             */
+            n->phase = G9001_NAND_RANDOM_COL;
+            n->addr_count = 0;
+            break;
+        case 0xe0:
+            if (n->addr_count >= 2) {
+                n->col = n->addr[0] | (n->addr[1] << 8);
+            }
+            n->addr_count = 0;
+            n->data_ptr = n->col;
+            n->raw_stream = n->col >= n->data_size;
+            n->data_end = g9001_nand_stream_size(n);
+            n->phase = G9001_NAND_READ;
+            break;
         case 0xff:
             g9001_nand_reset(s);
             break;
@@ -848,7 +888,7 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
      * Address bytes are followed by data even without a confirm command
      * (the small-page read sequence), so latch as soon as data starts.
      */
-    if (n->addr_count != 0) {
+    if (n->addr_count != 0 && n->phase != G9001_NAND_RANDOM_COL) {
         g9001_nand_latch_addr(s);
         g9001_nand_load_page(s, g9001_nand_page_of(n->row));
         n->data_ptr = n->col;
@@ -875,7 +915,8 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
         if (n->raw_stream) {
             *value = n->data_ptr < sizeof(n->page) ? n->page[n->data_ptr] :
                      0xff;
-            if (n->ignore_ecc && n->data_ptr >= n->data_size) {
+            if (n->ignore_ecc && !n->spare_real &&
+                n->data_ptr >= n->data_size) {
                 *value = 0xff;
             }
             n->data_ptr++;
@@ -953,7 +994,9 @@ static uint64_t g9001_card_read_win(G9001State *s, G9001CardWin win,
         g9001_nand_byte(s, cle, ale, false, &v);
         ret |= (uint64_t)v << (8 * i);
         if (win != G9001_CARD_WIN_4 && s->trace_nand_kernel &&
-            s->card_win_reads[win] < 4096) {
+            g9001_knand_pc_wanted(s, g9001_current_pc()) &&
+            s->card_win_reads[win] <
+                (s->trace_nand_kernel_pc_min ? (1u << 20) : 4096)) {
             info_report("g9001-knand: rd win=%u cle=%d ale=%d val=0x%02x "
                         "pc=0x%08x", win, cle, ale, v, g9001_current_pc());
         }
@@ -993,7 +1036,9 @@ static void g9001_card_write_win(G9001State *s, G9001CardWin win,
         uint8_t v = (value >> (8 * i)) & 0xff;
 
         if (win != G9001_CARD_WIN_4 && s->trace_nand_kernel &&
-            s->card_win_writes[win] < 4096) {
+            g9001_knand_pc_wanted(s, g9001_current_pc()) &&
+            s->card_win_writes[win] <
+                (s->trace_nand_kernel_pc_min ? (1u << 20) : 4096)) {
             info_report("g9001-knand: wr win=%u cle=%d ale=%d val=0x%02x "
                         "pc=0x%08x", win, cle, ale, v, g9001_current_pc());
         }
@@ -2459,6 +2504,7 @@ static void g9001_init(MachineState *machine)
     s->trace_io = gms->trace_io;
     s->trace_nand = gms->trace_nand;
     s->trace_nand_kernel = gms->trace_nand_kernel;
+    s->trace_nand_kernel_pc_min = gms->trace_nand_kernel_pc_min;
     g9001_mmc_default_identity(&s->mmc);
     s->mmc.capacity_mb = gms->mmc_capacity_mb ? gms->mmc_capacity_mb : 128;
     if (gms->mmc_cid_hex != NULL) {
@@ -2524,6 +2570,7 @@ static void g9001_init(MachineState *machine)
     s->debug_boot_mode = gms->debug_boot_mode;
     s->nand_ecc_offset = gms->nand_ecc_offset;
     s->nand.ignore_ecc = gms->nand_ignore_ecc;
+    s->nand.spare_real = gms->nand_spare_real;
 
     memory_region_init_ram(&s->a0ram, NULL, "g9001.a0ram",
                            G9001_A0RAM_SIZE, &error_fatal);
@@ -2782,6 +2829,16 @@ static void g9001_set_nand_ignore_ecc(Object *obj, bool value, Error **errp)
     G9001_MACHINE(obj)->nand_ignore_ecc = value;
 }
 
+static bool g9001_get_nand_spare_real(Object *obj, Error **errp)
+{
+    return G9001_MACHINE(obj)->nand_spare_real;
+}
+
+static void g9001_set_nand_spare_real(Object *obj, bool value, Error **errp)
+{
+    G9001_MACHINE(obj)->nand_spare_real = value;
+}
+
 static bool g9001_get_slp_as_nop(Object *obj, Error **errp)
 {
     return G9001_MACHINE(obj)->slp_as_nop;
@@ -2888,6 +2945,13 @@ static void g9001_machine_instance_init(Object *obj)
     object_property_set_description(obj, "trace-nand-kernel",
                                     "Log only the kernel NAND accesses "
                                     "(Area 11/14 windows, not the MBR)");
+    object_property_add_uint32_ptr(obj, "trace-nand-kernel-pc-min",
+                                   &gms->trace_nand_kernel_pc_min,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "trace-nand-kernel-pc-min",
+                                    "Only log kernel NAND accesses made from a "
+                                    "pc >= this address (0 = no filter); also "
+                                    "raises the per-window byte cap");
     object_property_add_bool(obj, "trace-irq", g9001_get_trace_irq,
                              g9001_set_trace_irq);
     object_property_set_description(obj, "trace-irq",
@@ -2988,6 +3052,14 @@ static void g9001_machine_instance_init(Object *obj)
                                     "Return a blank (all-FF) spare area so the "
                                     "firmware software ECC check accepts every "
                                     "page");
+    object_property_add_bool(obj, "nand-spare-real",
+                             g9001_get_nand_spare_real,
+                             g9001_set_nand_spare_real);
+    object_property_set_description(obj, "nand-spare-real",
+                                    "Keep nand-ignore-ecc for the interleaved "
+                                    "ECC bytes but return the stored spare "
+                                    "bytes when the firmware reads the spare "
+                                    "area directly (column >= page data size)");
     object_property_add_bool(obj, "nand-kernel-4k",
                              g9001_get_kernel_4k, g9001_set_kernel_4k);
     object_property_set_description(obj, "nand-kernel-4k",
