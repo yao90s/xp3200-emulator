@@ -57,8 +57,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(G9001MachineState, G9001_MACHINE)
 #define G9001_AREA1_BASE        0x00020000u
 #define G9001_AREA1_SIZE        (256 * KiB)
 #define G9001_IVRAM_BASE        0x00080000u
-#define G9001_IVRAM_SIZE        (12 * KiB)
-#define G9001_DSTRAM_BASE       0x00083000u
+#define G9001_IVRAM_SIZE        (16 * KiB)   /* Area 3 covers 0x80000-0x83fff */
+#define G9001_DSTRAM_BASE       0x00084000u
 #define G9001_DSTRAM_SIZE       (2 * KiB)
 #define G9001_CARD4_BASE        0x00100000u
 #define G9001_CARD4_SIZE        (1 * MiB)
