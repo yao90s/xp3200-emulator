@@ -137,6 +137,8 @@ static const Property s1c33_cpu_properties[] = {
     DEFINE_PROP_UINT32("trace-trap-addr2", S1C33CPU, trace_trap_addr2, 0),
     DEFINE_PROP_BOOL("unimplemented-as-nop", S1C33CPU, unimpl_as_nop, false),
     DEFINE_PROP_UINT32("trace-watch-addr", S1C33CPU, trace_watch_addr, 0),
+    DEFINE_PROP_UINT32("stop-outside-lo", S1C33CPU, stop_outside_lo, 0),
+    DEFINE_PROP_UINT32("stop-outside-hi", S1C33CPU, stop_outside_hi, 0),
     DEFINE_PROP_UINT32("trace-watch-size", S1C33CPU, trace_watch_size, 4),
 };
 

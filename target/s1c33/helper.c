@@ -17,6 +17,9 @@
 #define S1C33_DEBUG_SDRAM_BASE      0x02000000u
 #define S1C33_DEBUG_SDRAM_LIMIT     0x04000000u
 
+static G_NORETURN void s1c33_enter_halt(CPUS1C33State *env, CPUState *cs,
+                                        bool request_shutdown, bool is_sleep);
+
 static void s1c33_trap_dump(CPUS1C33State *env, uint32_t pc)
 {
     CPUState *cs = env_cpu(env);
@@ -86,6 +89,21 @@ void helper_s1c33_record_tb(CPUS1C33State *env, uint32_t pc)
     if ((cpu->trace_trap_addr != 0 && pc == cpu->trace_trap_addr) ||
         (cpu->trace_trap_addr2 != 0 && pc == cpu->trace_trap_addr2)) {
         s1c33_trap_dump(env, pc);
+    }
+
+    if (cpu->stop_outside_lo != 0 && pc >= cpu->stop_outside_lo) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "s1c33-stop-outside: pc=0x%08x sp=0x%08x psr=0x%08x "
+                      "r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x "
+                      "r4=0x%08x r5=0x%08x r6=0x%08x r7=0x%08x\n",
+                      pc, env->sp, env->psr,
+                      env->regs[0], env->regs[1], env->regs[2], env->regs[3],
+                      env->regs[4], env->regs[5], env->regs[6], env->regs[7]);
+        warn_report("S1C33 stopped at wild pc=0x%08x (threshold 0x%08x)",
+                    pc, cpu->stop_outside_lo);
+        env->pc = pc;
+        s1c33_enter_halt(env, cs, true, false);
+        return;
     }
 
     if (cpu->trace_watch_addr != 0) {
