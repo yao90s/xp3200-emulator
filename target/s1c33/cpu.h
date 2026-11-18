@@ -110,6 +110,7 @@ struct ArchCPU {
     uint32_t trace_mem_pc_end;
     uint32_t trace_trap_addr;
     uint32_t trace_trap_addr2;
+    bool unimpl_as_nop;             /* log unimplemented opcodes, keep running */
     uint32_t trace_watch_addr;      /* guest address whose value is watched */
     uint32_t trace_watch_last;      /* last observed value */
     uint32_t trace_watch_size;      /* 1/2/4 bytes */

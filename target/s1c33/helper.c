@@ -686,6 +686,15 @@ G_NORETURN void helper_s1c33_unimplemented(CPUS1C33State *env,
 {
     CPUState *cs = env_cpu(env);
 
+    S1C33CPU *cpu = S1C33_CPU(cs);
+
+    if (cpu->unimpl_as_nop) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "s1c33: unimplemented opcode 0x%04x at pc=0x%08x "
+                      "(ignored)\n",
+                      insn & 0xffff, env->pc);
+        return;
+    }
     warn_report("S1C33 guest shutdown: unimplemented opcode 0x%04x "
                 "at pc=0x%08x",
                 insn & 0xffff, env->pc);
