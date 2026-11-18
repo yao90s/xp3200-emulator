@@ -288,6 +288,9 @@ typedef struct G9001MachineState {
     uint32_t debug_dump_addr;
     uint32_t debug_dump_size;
     uint32_t debug_dump_ms;
+    uint32_t debug_poke_addr;       /* guest byte address to poke, 0 = off */
+    uint32_t debug_poke_value;
+    uint32_t debug_poke_ms;
     uint32_t debug_exit_on_stall_ms;
     char *debug_dump_path;
     char *spi_image_path;
@@ -425,6 +428,7 @@ typedef struct G9001State {
     uint8_t hsdma_start_latch;
     bool hsdma_busy;
     QEMUTimer *dump_timer;
+    QEMUTimer *poke_timer;
     bool dump_done;
     QEMUTimer *stall_timer;
     uint64_t stall_last;
@@ -1486,6 +1490,20 @@ static void g9001_mem_dump(void *opaque)
                     gms->debug_dump_path, wrote);
     }
     g_free(buf);
+}
+
+/* Re-apply a one-byte value to a guest address (diagnostic what-if knob).
+ * It repeats because the firmware may clear the byte during init; the point is
+ * to make the value visible whenever a given read happens. */
+static void g9001_poke_cb(void *opaque)
+{
+    G9001State *s = opaque;
+    G9001MachineState *gms = G9001_MACHINE(s->machine);
+
+    address_space_stb(&address_space_memory, (hwaddr)gms->debug_poke_addr,
+                      gms->debug_poke_value & 0xff,
+                      MEMTXATTRS_UNSPECIFIED, NULL);
+    timer_mod(s->poke_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
 }
 
 static void g9001_lcd_dump_pgm(G9001State *s, const char *path)
@@ -2764,6 +2782,14 @@ static void g9001_init(MachineState *machine)
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
                   (gms->debug_dump_ms ? gms->debug_dump_ms : 1000));
     }
+    if (gms->debug_poke_addr != 0 && gms->debug_poke_ms != 0) {
+        s->poke_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, g9001_poke_cb, s);
+        timer_mod(s->poke_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + gms->debug_poke_ms);
+        info_report("g9001: poking 0x%08x=%u every 10 ms from %u ms",
+                    gms->debug_poke_addr, gms->debug_poke_value & 0xff,
+                    gms->debug_poke_ms);
+    }
     if (gms->debug_spi_test) {
         g9001_spi_selftest(s);
     }
@@ -3307,6 +3333,21 @@ static void g9001_machine_instance_init(Object *obj)
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_set_description(obj, "debug-dump-mem-ms",
                                     "Dump the memory after this many ms");
+    object_property_add_uint32_ptr(obj, "debug-poke-addr",
+                                   &gms->debug_poke_addr,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "debug-poke-addr",
+                                    "Guest byte address poked with debug-poke-value");
+    object_property_add_uint32_ptr(obj, "debug-poke-value",
+                                   &gms->debug_poke_value,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "debug-poke-value",
+                                    "Byte written to debug-poke-addr every 10 ms");
+    object_property_add_uint32_ptr(obj, "debug-poke-ms",
+                                   &gms->debug_poke_ms,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "debug-poke-ms",
+                                    "Start the poke after this many ms");
     object_property_add_str(obj, "debug-dump-mem-path",
                             g9001_get_dump_path, g9001_set_dump_path);
     object_property_set_description(obj, "debug-dump-mem-path",
