@@ -2149,8 +2149,8 @@ typedef struct G9001IrqSource {
 } G9001IrqSource;
 
 static const G9001IrqSource g9001_irq_sources[] = {
-    { 0x0281, 0x02a1, 0x0266, 0, 0x04, 30, "16TM0B" },
-    { 0x0281, 0x02a1, 0x0266, 0, 0x08, 31, "16TM0A" },
+    { 0x0282, 0x0272, 0x0266, 0, 0x04, 30, "16TM0B" },
+    { 0x0282, 0x0272, 0x0266, 0, 0x08, 31, "16TM0A" },
 };
 
 static void g9001_update_irq(G9001State *s)
@@ -2224,10 +2224,10 @@ static void g9001_t16_advance(G9001State *s)
     while (counts-- > 0) {
         t->counter++;
         if (t->counter == t->ca) {
-            s->io[0x0281] |= 0x08;          /* compare A */
+            s->io[0x0282] |= 0x08;          /* compare A */
         }
         if (t->counter == t->cb) {
-            s->io[0x0281] |= 0x04;          /* compare B */
+            s->io[0x0282] |= 0x04;          /* compare B */
         }
         if (t->counter >= period) {
             t->counter = 0;
