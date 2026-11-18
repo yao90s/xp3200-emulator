@@ -295,6 +295,8 @@ typedef struct G9001MachineState {
     uint32_t debug_poke_ms;
     char *debug_poke_hex;           /* optional multi-byte patch, e.g. "6c0a0640" */
     char *debug_patches;            /* "addr:hex;addr:hex" list of patches */
+    char *debug_copy_spec;          /* "dst:src:len", applied once */
+    uint32_t debug_copy_ms;
     bool debug_poke_fast;           /* re-arm the poke timer every 0.2 ms */
     uint32_t debug_exit_on_stall_ms;
     char *debug_dump_path;
@@ -389,6 +391,7 @@ typedef struct G9001State {
     bool lcd_dirty;
     bool trace_io;
     bool poke_fast;
+    bool copy_done;
     bool trace_nand;
     bool trace_nand_latch;
     bool trace_nand_latch_log;
@@ -1530,6 +1533,48 @@ static void g9001_io_dump(void *opaque)
         info_report("g9001: dumped IO image (%u bytes) to %s (%zd written)",
                     (unsigned)G9001_IO_SIZE, gms->debug_io_dump_path, wrote);
     }
+}
+
+/* One-shot block copy inside guest RAM (diagnostic what-if knob). */
+static void g9001_copy_cb(void *opaque)
+{
+    G9001State *s = opaque;
+    G9001MachineState *gms = G9001_MACHINE(s->machine);
+    unsigned long dst = 0, src = 0, len = 0;
+    uint8_t *buf;
+
+    if (s->copy_done || gms->debug_copy_spec == NULL) {
+        return;
+    }
+    {
+        const char *q = gms->debug_copy_spec;
+        char *end = NULL;
+
+        dst = strtoul(q, &end, 0);
+        if (end == q || *end != ':') {
+            dst = 0;
+        } else {
+            q = end + 1;
+            src = strtoul(q, &end, 0);
+            if (end == q || *end != ':') {
+                dst = 0;
+            } else {
+                len = strtoul(end + 1, &end, 0);
+            }
+        }
+    }
+    if (dst == 0 || len == 0 || len > 4 * 1024 * 1024) {
+        error_report("g9001: bad debug-copy spec '%s'", gms->debug_copy_spec);
+        return;
+    }
+    s->copy_done = true;
+    buf = g_malloc(len);
+    address_space_read(&address_space_memory, (hwaddr)src,
+                       MEMTXATTRS_UNSPECIFIED, buf, len);
+    address_space_write(&address_space_memory, (hwaddr)dst,
+                        MEMTXATTRS_UNSPECIFIED, buf, len);
+    g_free(buf);
+    info_report("g9001: copied %lu bytes 0x%lx -> 0x%lx", len, src, dst);
 }
 
 /* Re-apply a one-byte value to a guest address (diagnostic what-if knob).
@@ -2862,6 +2907,12 @@ static void g9001_init(MachineState *machine)
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
                   gms->debug_exit_on_stall_ms);
     }
+    if (gms->debug_copy_spec != NULL && gms->debug_copy_spec[0] != '\0') {
+        uint32_t ms = gms->debug_copy_ms ? gms->debug_copy_ms : 1000;
+        QEMUTimer *t = timer_new_ms(QEMU_CLOCK_REALTIME, g9001_copy_cb, s);
+
+        timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + ms);
+    }
     if (gms->debug_io_dump_path != NULL) {
         uint32_t ms = gms->debug_io_dump_ms ? gms->debug_io_dump_ms : 1000;
         QEMUTimer *t = timer_new_ms(QEMU_CLOCK_REALTIME, g9001_io_dump, s);
@@ -3176,6 +3227,19 @@ static bool g9001_get_poke_fast(Object *obj, Error **errp)
 static void g9001_set_poke_fast(Object *obj, bool value, Error **errp)
 {
     G9001_MACHINE(obj)->debug_poke_fast = value;
+}
+
+static char *g9001_get_copy_spec(Object *obj, Error **errp)
+{
+    return g_strdup(G9001_MACHINE(obj)->debug_copy_spec);
+}
+
+static void g9001_set_copy_spec(Object *obj, const char *value, Error **errp)
+{
+    G9001MachineState *gms = G9001_MACHINE(obj);
+
+    g_free(gms->debug_copy_spec);
+    gms->debug_copy_spec = g_strdup(value);
 }
 
 static char *g9001_get_patches(Object *obj, Error **errp)
@@ -3519,6 +3583,15 @@ static void g9001_machine_instance_init(Object *obj)
                              g9001_get_poke_fast, g9001_set_poke_fast);
     object_property_set_description(obj, "debug-poke-fast",
                                     "Re-apply debug-patches every 0.2 ms");
+    object_property_add_str(obj, "debug-copy",
+                            g9001_get_copy_spec, g9001_set_copy_spec);
+    object_property_set_description(obj, "debug-copy",
+                                    "One-shot guest RAM copy 'dst:src:len'");
+    object_property_add_uint32_ptr(obj, "debug-copy-ms",
+                                   &gms->debug_copy_ms,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "debug-copy-ms",
+                                    "When to run debug-copy (ms, realtime)");
     object_property_add_str(obj, "debug-patches",
                             g9001_get_patches, g9001_set_patches);
     object_property_set_description(obj, "debug-patches",
