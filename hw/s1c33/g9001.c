@@ -296,6 +296,8 @@ typedef struct G9001MachineState {
     char *debug_patches;            /* "addr:hex;addr:hex" list of patches */
     uint32_t debug_exit_on_stall_ms;
     char *debug_dump_path;
+    char *debug_io_dump_path;       /* dump the internal IO image here */
+    uint32_t debug_io_dump_ms;
     char *spi_image_path;
     char *mmc_cid_hex;
     char *mmc_csd_hex;
@@ -434,6 +436,7 @@ typedef struct G9001State {
     QEMUTimer *dump_timer;
     QEMUTimer *poke_timer;
     bool dump_done;
+    bool io_dump_done;
     QEMUTimer *stall_timer;
     uint64_t stall_last;
     unsigned stall_count;
@@ -1499,6 +1502,31 @@ static void g9001_mem_dump(void *opaque)
                     gms->debug_dump_path, wrote);
     }
     g_free(buf);
+}
+
+/* Dump the machine's internal IO register image (the 0x300000 window). */
+static void g9001_io_dump(void *opaque)
+{
+    G9001State *s = opaque;
+    G9001MachineState *gms = G9001_MACHINE(s->machine);
+    int fd;
+
+    if (s->io_dump_done || gms->debug_io_dump_path == NULL) {
+        return;
+    }
+    s->io_dump_done = true;
+    fd = open(gms->debug_io_dump_path, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY,
+              0644);
+    if (fd < 0) {
+        error_report("g9001: cannot write IO dump '%s': %s",
+                     gms->debug_io_dump_path, strerror(errno));
+    } else {
+        ssize_t wrote = write(fd, s->io, G9001_IO_SIZE);
+
+        close(fd);
+        info_report("g9001: dumped IO image (%u bytes) to %s (%zd written)",
+                    (unsigned)G9001_IO_SIZE, gms->debug_io_dump_path, wrote);
+    }
 }
 
 /* Re-apply a one-byte value to a guest address (diagnostic what-if knob).
@@ -2826,6 +2854,12 @@ static void g9001_init(MachineState *machine)
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
                   gms->debug_exit_on_stall_ms);
     }
+    if (gms->debug_io_dump_path != NULL) {
+        uint32_t ms = gms->debug_io_dump_ms ? gms->debug_io_dump_ms : 1000;
+        QEMUTimer *t = timer_new_ms(QEMU_CLOCK_REALTIME, g9001_io_dump, s);
+
+        timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + ms);
+    }
     if (gms->debug_dump_path != NULL && gms->debug_dump_size != 0) {
         s->dump_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, g9001_mem_dump, s);
         timer_mod(s->dump_timer,
@@ -3137,6 +3171,19 @@ static void g9001_set_patches(Object *obj, const char *value, Error **errp)
 
     g_free(gms->debug_patches);
     gms->debug_patches = g_strdup(value);
+}
+
+static char *g9001_get_io_dump_path(Object *obj, Error **errp)
+{
+    return g_strdup(G9001_MACHINE(obj)->debug_io_dump_path);
+}
+
+static void g9001_set_io_dump_path(Object *obj, const char *value, Error **errp)
+{
+    G9001MachineState *gms = G9001_MACHINE(obj);
+
+    g_free(gms->debug_io_dump_path);
+    gms->debug_io_dump_path = g_strdup(value);
 }
 
 static char *g9001_get_spi_image(Object *obj, Error **errp)
@@ -3461,6 +3508,15 @@ static void g9001_machine_instance_init(Object *obj)
     object_property_set_description(obj, "debug-poke-hex",
                                     "Hex byte string (e.g. 6c0a0640) poked at "
                                     "debug-poke-addr; overrides debug-poke-value");
+    object_property_add_str(obj, "debug-dump-io-path",
+                            g9001_get_io_dump_path, g9001_set_io_dump_path);
+    object_property_set_description(obj, "debug-dump-io-path",
+                                    "File that receives the internal IO image");
+    object_property_add_uint32_ptr(obj, "debug-dump-io-ms",
+                                   &gms->debug_io_dump_ms,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "debug-dump-io-ms",
+                                    "When to write the IO image (ms, realtime)");
     object_property_add_str(obj, "debug-dump-mem-path",
                             g9001_get_dump_path, g9001_set_dump_path);
     object_property_set_description(obj, "debug-dump-mem-path",
