@@ -135,6 +135,8 @@ static const Property s1c33_cpu_properties[] = {
     DEFINE_PROP_UINT32("trace-mem-pc-end", S1C33CPU, trace_mem_pc_end, 0),
     DEFINE_PROP_UINT32("trace-trap-addr", S1C33CPU, trace_trap_addr, 0),
     DEFINE_PROP_UINT32("trace-trap-addr2", S1C33CPU, trace_trap_addr2, 0),
+    DEFINE_PROP_UINT32("trace-watch-addr", S1C33CPU, trace_watch_addr, 0),
+    DEFINE_PROP_UINT32("trace-watch-size", S1C33CPU, trace_watch_size, 4),
 };
 
 static void s1c33_cpu_realize(DeviceState *dev, Error **errp)

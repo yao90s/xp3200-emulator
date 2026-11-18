@@ -88,6 +88,22 @@ void helper_s1c33_record_tb(CPUS1C33State *env, uint32_t pc)
         s1c33_trap_dump(env, pc);
     }
 
+    if (cpu->trace_watch_addr != 0) {
+        uint8_t b[4] = { 0, 0, 0, 0 };
+        uint32_t v;
+
+        cpu_memory_rw_debug(cs, cpu->trace_watch_addr & ~3u, b, 4, false);
+        v = (uint32_t)b[0] | ((uint32_t)b[1] << 8) |
+            ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+        if (v != cpu->trace_watch_last) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "s1c33-watch: pc=0x%08x addr=0x%08x val=0x%08x "
+                          "was=0x%08x\n",
+                          pc, cpu->trace_watch_addr, v, cpu->trace_watch_last);
+            cpu->trace_watch_last = v;
+        }
+    }
+
     if (cpu->trace_exec) {
         uint32_t end = cpu->trace_exec_end != 0 ?
                        cpu->trace_exec_end : UINT32_MAX;
