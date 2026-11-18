@@ -274,6 +274,7 @@ typedef struct G9001MachineState {
     bool trace_io;
     bool trace_nand;
     bool trace_nand_latch;
+    bool trace_nand_latch_log;
     bool trace_nand_kernel;
     uint32_t trace_nand_kernel_pc_min;
     bool trace_irq;
@@ -384,6 +385,7 @@ typedef struct G9001State {
     bool trace_io;
     bool trace_nand;
     bool trace_nand_latch;
+    bool trace_nand_latch_log;
     bool trace_nand_kernel;
     uint32_t trace_nand_kernel_pc_min;
     bool trace_irq;
@@ -787,6 +789,11 @@ static void g9001_nand_latch_addr(G9001State *s)
                     "pc=0x%08x (byte offset %" PRIu64 ")",
                     n->addr_count, n->col, n->row, g9001_current_pc(),
                     (uint64_t)n->row * G9001_NAND_RAW_PAGE + n->col);
+    }
+    if (s->trace_nand_latch_log && n->addr_count) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "g9001-latch-log: col=%u row=%u pc=0x%08x\n",
+                      n->col, n->row, g9001_current_pc());
     }
     n->addr_count = 0;
 }
@@ -2751,6 +2758,7 @@ static void g9001_init(MachineState *machine)
     s->trace_io = gms->trace_io;
     s->trace_nand = gms->trace_nand;
     s->trace_nand_latch = gms->trace_nand_latch;
+    s->trace_nand_latch_log = gms->trace_nand_latch_log;
     s->trace_nand_kernel = gms->trace_nand_kernel;
     s->trace_nand_kernel_pc_min = gms->trace_nand_kernel_pc_min;
     g9001_mmc_default_identity(&s->mmc);
@@ -3000,6 +3008,17 @@ static bool g9001_get_trace_nand_latch(Object *obj, Error **errp)
 static void g9001_set_trace_nand_latch(Object *obj, bool value, Error **errp)
 {
     G9001_MACHINE(obj)->trace_nand_latch = value;
+}
+
+static bool g9001_get_trace_nand_latch_log(Object *obj, Error **errp)
+{
+    return G9001_MACHINE(obj)->trace_nand_latch_log;
+}
+
+static void g9001_set_trace_nand_latch_log(Object *obj, bool value,
+                                           Error **errp)
+{
+    G9001_MACHINE(obj)->trace_nand_latch_log = value;
 }
 
 static bool g9001_get_trace_irq(Object *obj, Error **errp)
@@ -3299,6 +3318,12 @@ static void g9001_machine_instance_init(Object *obj)
                              g9001_set_trace_nand);
     object_property_set_description(obj, "trace-nand",
                                     "Log NAND command/address/data activity");
+    object_property_add_bool(obj, "trace-nand-latch-log",
+                             g9001_get_trace_nand_latch_log,
+                             g9001_set_trace_nand_latch_log);
+    object_property_set_description(obj, "trace-nand-latch-log",
+                                    "Latch trace through qemu_log so it lands in "
+                                    "the same -D file as -d trace-calls");
     object_property_add_bool(obj, "trace-nand-latch",
                              g9001_get_trace_nand_latch,
                              g9001_set_trace_nand_latch);
