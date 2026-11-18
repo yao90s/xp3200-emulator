@@ -291,6 +291,7 @@ typedef struct G9001MachineState {
     uint32_t debug_poke_addr;       /* guest byte address to poke, 0 = off */
     uint32_t debug_poke_value;
     uint32_t debug_poke_ms;
+    char *debug_poke_hex;           /* optional multi-byte patch, e.g. "6c0a0640" */
     uint32_t debug_exit_on_stall_ms;
     char *debug_dump_path;
     char *spi_image_path;
@@ -1500,9 +1501,24 @@ static void g9001_poke_cb(void *opaque)
     G9001State *s = opaque;
     G9001MachineState *gms = G9001_MACHINE(s->machine);
 
-    address_space_stb(&address_space_memory, (hwaddr)gms->debug_poke_addr,
-                      gms->debug_poke_value & 0xff,
-                      MEMTXATTRS_UNSPECIFIED, NULL);
+    if (gms->debug_poke_hex != NULL && gms->debug_poke_hex[0] != '\0') {
+        const char *p = gms->debug_poke_hex;
+        hwaddr a = gms->debug_poke_addr;
+
+        while (p[0] && p[1]) {
+            unsigned v = 0;
+            if (sscanf(p, "%2x", &v) != 1) {
+                break;
+            }
+            address_space_stb(&address_space_memory, a++, v,
+                              MEMTXATTRS_UNSPECIFIED, NULL);
+            p += 2;
+        }
+    } else {
+        address_space_stb(&address_space_memory, (hwaddr)gms->debug_poke_addr,
+                          gms->debug_poke_value & 0xff,
+                          MEMTXATTRS_UNSPECIFIED, NULL);
+    }
     timer_mod(s->poke_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
 }
 
@@ -2782,12 +2798,15 @@ static void g9001_init(MachineState *machine)
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
                   (gms->debug_dump_ms ? gms->debug_dump_ms : 1000));
     }
-    if (gms->debug_poke_addr != 0 && gms->debug_poke_ms != 0) {
+    if (gms->debug_poke_addr != 0 && gms->debug_poke_ms != 0 &&
+        (gms->debug_poke_value != 0 || gms->debug_poke_hex != NULL)) {
         s->poke_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, g9001_poke_cb, s);
         timer_mod(s->poke_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + gms->debug_poke_ms);
-        info_report("g9001: poking 0x%08x=%u every 10 ms from %u ms",
-                    gms->debug_poke_addr, gms->debug_poke_value & 0xff,
+        info_report("g9001: poking 0x%08x (%s%s) every 10 ms from %u ms",
+                    gms->debug_poke_addr,
+                    gms->debug_poke_hex ? gms->debug_poke_hex : "",
+                    gms->debug_poke_hex ? "" : "byte",
                     gms->debug_poke_ms);
     }
     if (gms->debug_spi_test) {
@@ -3041,6 +3060,19 @@ static void g9001_set_dump_path(Object *obj, const char *value, Error **errp)
 
     g_free(gms->debug_dump_path);
     gms->debug_dump_path = g_strdup(value);
+}
+
+static char *g9001_get_poke_hex(Object *obj, Error **errp)
+{
+    return g_strdup(G9001_MACHINE(obj)->debug_poke_hex);
+}
+
+static void g9001_set_poke_hex(Object *obj, const char *value, Error **errp)
+{
+    G9001MachineState *gms = G9001_MACHINE(obj);
+
+    g_free(gms->debug_poke_hex);
+    gms->debug_poke_hex = g_strdup(value);
 }
 
 static char *g9001_get_spi_image(Object *obj, Error **errp)
@@ -3348,6 +3380,11 @@ static void g9001_machine_instance_init(Object *obj)
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_set_description(obj, "debug-poke-ms",
                                     "Start the poke after this many ms");
+    object_property_add_str(obj, "debug-poke-hex",
+                            g9001_get_poke_hex, g9001_set_poke_hex);
+    object_property_set_description(obj, "debug-poke-hex",
+                                    "Hex byte string (e.g. 6c0a0640) poked at "
+                                    "debug-poke-addr; overrides debug-poke-value");
     object_property_add_str(obj, "debug-dump-mem-path",
                             g9001_get_dump_path, g9001_set_dump_path);
     object_property_set_description(obj, "debug-dump-mem-path",
