@@ -272,6 +272,7 @@ typedef struct G9001MachineState {
     uint32_t debug_lcd_dump_ms;
     uint32_t debug_pc_sample_ms;
     bool trace_io;
+    bool poke_fast;
     bool trace_nand;
     bool trace_nand_latch;
     bool trace_nand_latch_log;
@@ -294,6 +295,7 @@ typedef struct G9001MachineState {
     uint32_t debug_poke_ms;
     char *debug_poke_hex;           /* optional multi-byte patch, e.g. "6c0a0640" */
     char *debug_patches;            /* "addr:hex;addr:hex" list of patches */
+    bool debug_poke_fast;           /* re-arm the poke timer every 0.2 ms */
     uint32_t debug_exit_on_stall_ms;
     char *debug_dump_path;
     char *debug_io_dump_path;       /* dump the internal IO image here */
@@ -386,6 +388,7 @@ typedef struct G9001State {
     uint8_t port_prev[G9001_KEY_PORTS];
     bool lcd_dirty;
     bool trace_io;
+    bool poke_fast;
     bool trace_nand;
     bool trace_nand_latch;
     bool trace_nand_latch_log;
@@ -1580,7 +1583,11 @@ static void g9001_poke_cb(void *opaque)
                           gms->debug_poke_value & 0xff,
                           MEMTXATTRS_UNSPECIFIED, NULL);
     }
-    timer_mod(s->poke_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 10);
+    /* Re-arm quickly: the firmware may memset a region and jump into it
+     * within the same millisecond, which would otherwise eat the patch. */
+    timer_mod(s->poke_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+              (s->poke_fast ? 200000 : 10000000));
 }
 
 static void g9001_lcd_dump_pgm(G9001State *s, const char *path)
@@ -2810,6 +2817,7 @@ static void g9001_init(MachineState *machine)
     s->machine = machine;
     s->nand.cached_page = -1;
     s->trace_io = gms->trace_io;
+    s->poke_fast = gms->debug_poke_fast;
     s->trace_nand = gms->trace_nand;
     s->trace_nand_latch = gms->trace_nand_latch;
     s->trace_nand_latch_log = gms->trace_nand_latch_log;
@@ -3160,6 +3168,16 @@ static void g9001_set_poke_hex(Object *obj, const char *value, Error **errp)
     gms->debug_poke_hex = g_strdup(value);
 }
 
+static bool g9001_get_poke_fast(Object *obj, Error **errp)
+{
+    return G9001_MACHINE(obj)->debug_poke_fast;
+}
+
+static void g9001_set_poke_fast(Object *obj, bool value, Error **errp)
+{
+    G9001_MACHINE(obj)->debug_poke_fast = value;
+}
+
 static char *g9001_get_patches(Object *obj, Error **errp)
 {
     return g_strdup(G9001_MACHINE(obj)->debug_patches);
@@ -3497,6 +3515,10 @@ static void g9001_machine_instance_init(Object *obj)
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_set_description(obj, "debug-poke-ms",
                                     "Start the poke after this many ms");
+    object_property_add_bool(obj, "debug-poke-fast",
+                             g9001_get_poke_fast, g9001_set_poke_fast);
+    object_property_set_description(obj, "debug-poke-fast",
+                                    "Re-apply debug-patches every 0.2 ms");
     object_property_add_str(obj, "debug-patches",
                             g9001_get_patches, g9001_set_patches);
     object_property_set_description(obj, "debug-patches",
