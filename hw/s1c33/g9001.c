@@ -392,6 +392,8 @@ typedef struct G9001State {
     bool trace_io;
     bool poke_fast;
     bool copy_done;
+    QEMUTimer *copy_timer;
+    uint32_t copy_period_ms;
     bool trace_nand;
     bool trace_nand_latch;
     bool trace_nand_latch_log;
@@ -1543,7 +1545,7 @@ static void g9001_copy_cb(void *opaque)
     unsigned long dst = 0, src = 0, len = 0;
     uint8_t *buf;
 
-    if (s->copy_done || gms->debug_copy_spec == NULL) {
+    if (gms->debug_copy_spec == NULL) {
         return;
     }
     {
@@ -1567,7 +1569,6 @@ static void g9001_copy_cb(void *opaque)
         error_report("g9001: bad debug-copy spec '%s'", gms->debug_copy_spec);
         return;
     }
-    s->copy_done = true;
     buf = g_malloc(len);
     address_space_read(&address_space_memory, (hwaddr)src,
                        MEMTXATTRS_UNSPECIFIED, buf, len);
@@ -1575,6 +1576,10 @@ static void g9001_copy_cb(void *opaque)
                         MEMTXATTRS_UNSPECIFIED, buf, len);
     g_free(buf);
     info_report("g9001: copied %lu bytes 0x%lx -> 0x%lx", len, src, dst);
+    if (s->copy_timer != NULL && s->copy_period_ms != 0) {
+        timer_mod(s->copy_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + s->copy_period_ms);
+    }
 }
 
 /* Re-apply a one-byte value to a guest address (diagnostic what-if knob).
@@ -2909,9 +2914,10 @@ static void g9001_init(MachineState *machine)
     }
     if (gms->debug_copy_spec != NULL && gms->debug_copy_spec[0] != '\0') {
         uint32_t ms = gms->debug_copy_ms ? gms->debug_copy_ms : 1000;
-        QEMUTimer *t = timer_new_ms(QEMU_CLOCK_REALTIME, g9001_copy_cb, s);
-
-        timer_mod(t, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + ms);
+        /* copy virtual */ s->copy_timer =
+            timer_new_ms(QEMU_CLOCK_VIRTUAL, g9001_copy_cb, s);
+        s->copy_period_ms = ms;
+        timer_mod(s->copy_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + ms);
     }
     if (gms->debug_io_dump_path != NULL) {
         uint32_t ms = gms->debug_io_dump_ms ? gms->debug_io_dump_ms : 1000;
