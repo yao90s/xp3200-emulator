@@ -49,6 +49,15 @@ static TCGv_i32 cpu_ahr;
 static TCGv_i32 cpu_ext[2];
 static TCGv_i32 cpu_ext_count;
 static TCGv_i32 cpu_ttbr;
+static TCGv_i32 cpu_dp;
+static TCGv_i32 cpu_lco;
+static TCGv_i32 cpu_lsa;
+static TCGv_i32 cpu_lea;
+static TCGv_i32 cpu_sor;
+static TCGv_i32 cpu_idir;
+static TCGv_i32 cpu_dbbr;
+static TCGv_i32 cpu_usp;
+static TCGv_i32 cpu_ssp;
 
 static uint32_t s1c33_sign6(uint16_t word)
 {
@@ -97,6 +106,9 @@ static TCGv_i32 s1c33_special_reg(unsigned reg)
     case 8:
         /* TTBR: trap table base, bits 9..0 read back as zero. */
         return cpu_ttbr;
+    case 9:
+        /* DP: data pointer, used by the `add %rN,%dp` addressing help. */
+        return cpu_dp;
     default:
         return NULL;
     }
@@ -1423,6 +1435,49 @@ static void translate_one(DisasContext *ctx, uint16_t word)
         gen_software_interrupt(ctx, word);
         return;
     }
+    if ((word >= 0x0090 && word <= 0x009f) ||
+        (word >= 0x00b0 && word <= 0x00bf) ||
+        (word >= 0x00c0 && word <= 0x00cf) ||
+        (word >= 0x00d0 && word <= 0x00df) ||
+        (word >= 0x00f0 && word <= 0x00ff)) {
+        /* pushs/pops %special */
+        unsigned idx = word & 0xf;
+        TCGv_i32 sr = s1c33_special_reg(idx);
+        bool is_pop = (word & 0xf0) >= 0xc0;
+
+        if (sr != NULL) {
+            if (is_pop) {
+                tcg_gen_qemu_ld_i32(sr, cpu_sp, 0, MO_LEUL);
+                tcg_gen_addi_i32(cpu_sp, cpu_sp, 4);
+            } else {
+                tcg_gen_subi_i32(cpu_sp, cpu_sp, 4);
+                tcg_gen_qemu_st_i32(sr, cpu_sp, 0, MO_LEUL);
+            }
+        }
+        gen_clear_ext(ctx);
+        return;
+    }
+    if ((word >= 0x0010 && word <= 0x001f) ||
+        (word >= 0x0030 && word <= 0x003f)) {
+        /* push %rN : sp -= 4 ; [sp] = rN */
+        tcg_gen_subi_i32(cpu_sp, cpu_sp, 4);
+        tcg_gen_qemu_st_i32(cpu_regs[word & 0xf], cpu_sp, 0, MO_LEUL);
+        gen_clear_ext(ctx);
+        return;
+    }
+    if (word >= 0x0050 && word <= 0x005f) {
+        /* pop %rN : rN = [sp] ; sp += 4 */
+        tcg_gen_qemu_ld_i32(cpu_regs[word & 0xf], cpu_sp, 0, MO_LEUL);
+        tcg_gen_addi_i32(cpu_sp, cpu_sp, 4);
+        gen_clear_ext(ctx);
+        return;
+    }
+    if (word >= 0x0340 && word <= 0x034f) {
+        /* add %rN,%dp : dp += rN */
+        tcg_gen_add_i32(cpu_dp, cpu_dp, cpu_regs[word & 0xf]);
+        gen_clear_ext(ctx);
+        return;
+    }
     if (word >= 0x0200 && word <= 0x020f) {
         gen_pushn(ctx, word);
         return;
@@ -1697,4 +1752,22 @@ void s1c33_translate_init(void)
     cpu_ttbr = tcg_global_mem_new_i32(tcg_env,
                                       offsetof(CPUS1C33State, ttbr),
                                       "ttbr");
+    cpu_dp = tcg_global_mem_new_i32(tcg_env,
+                                    offsetof(CPUS1C33State, dp), "dp");
+    cpu_lco = tcg_global_mem_new_i32(tcg_env,
+                                     offsetof(CPUS1C33State, lco), "lco");
+    cpu_lsa = tcg_global_mem_new_i32(tcg_env,
+                                     offsetof(CPUS1C33State, lsa), "lsa");
+    cpu_lea = tcg_global_mem_new_i32(tcg_env,
+                                     offsetof(CPUS1C33State, lea), "lea");
+    cpu_sor = tcg_global_mem_new_i32(tcg_env,
+                                     offsetof(CPUS1C33State, sor), "sor");
+    cpu_idir = tcg_global_mem_new_i32(tcg_env,
+                                      offsetof(CPUS1C33State, idir), "idir");
+    cpu_dbbr = tcg_global_mem_new_i32(tcg_env,
+                                      offsetof(CPUS1C33State, dbbr), "dbbr");
+    cpu_usp = tcg_global_mem_new_i32(tcg_env,
+                                     offsetof(CPUS1C33State, usp), "usp");
+    cpu_ssp = tcg_global_mem_new_i32(tcg_env,
+                                     offsetof(CPUS1C33State, ssp), "ssp");
 }

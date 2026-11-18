@@ -77,6 +77,16 @@ typedef struct CPUArchState {
     uint32_t recent_tb_pos;
     uint32_t recent_tb_count;
     uint32_t ttbr;
+    uint32_t dp;                /* data pointer (special register 9) */
+    /* E08 extended core registers (special registers 4..7, 10, 11, 13, 14) */
+    uint32_t lco;
+    uint32_t lsa;
+    uint32_t lea;
+    uint32_t sor;
+    uint32_t idir;
+    uint32_t dbbr;
+    uint32_t usp;
+    uint32_t ssp;
     uint8_t irq_vector;
     uint8_t irq_level;
     bool irq_pending;
