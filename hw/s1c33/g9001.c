@@ -293,6 +293,7 @@ typedef struct G9001MachineState {
     uint32_t debug_poke_value;
     uint32_t debug_poke_ms;
     char *debug_poke_hex;           /* optional multi-byte patch, e.g. "6c0a0640" */
+    char *debug_patches;            /* "addr:hex;addr:hex" list of patches */
     uint32_t debug_exit_on_stall_ms;
     char *debug_dump_path;
     char *spi_image_path;
@@ -1508,7 +1509,32 @@ static void g9001_poke_cb(void *opaque)
     G9001State *s = opaque;
     G9001MachineState *gms = G9001_MACHINE(s->machine);
 
-    if (gms->debug_poke_hex != NULL && gms->debug_poke_hex[0] != '\0') {
+    if (gms->debug_patches != NULL && gms->debug_patches[0] != '\0') {
+        const char *q = gms->debug_patches;
+
+        while (*q) {
+            char *end = NULL;
+            unsigned long a = strtoul(q, &end, 0);
+            const char *p2;
+            hwaddr addr;
+
+            if (end == q || *end != ':' || a == 0) {
+                break;
+            }
+            addr = (hwaddr)a;
+            p2 = end + 1;
+            while (p2[0] && p2[1] && *p2 != ';') {
+                unsigned v = 0;
+                if (sscanf(p2, "%2x", &v) != 1) {
+                    break;
+                }
+                address_space_stb(&address_space_memory, addr++, v,
+                                  MEMTXATTRS_UNSPECIFIED, NULL);
+                p2 += 2;
+            }
+            q = (*p2 == ';') ? p2 + 1 : p2;
+        }
+    } else if (gms->debug_poke_hex != NULL && gms->debug_poke_hex[0] != '\0') {
         const char *p = gms->debug_poke_hex;
         hwaddr a = gms->debug_poke_addr;
 
@@ -2806,11 +2832,17 @@ static void g9001_init(MachineState *machine)
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
                   (gms->debug_dump_ms ? gms->debug_dump_ms : 1000));
     }
-    if (gms->debug_poke_addr != 0 && gms->debug_poke_ms != 0 &&
-        (gms->debug_poke_value != 0 || gms->debug_poke_hex != NULL)) {
+    if (gms->debug_poke_ms != 0 &&
+        ((gms->debug_poke_addr != 0 &&
+          (gms->debug_poke_value != 0 || gms->debug_poke_hex != NULL)) ||
+         (gms->debug_patches != NULL && gms->debug_patches[0] != '\0'))) {
         s->poke_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, g9001_poke_cb, s);
         timer_mod(s->poke_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + gms->debug_poke_ms);
+        if (gms->debug_patches != NULL && gms->debug_patches[0] != '\0') {
+            info_report("g9001: patch list '%s' every 10 ms from %u ms",
+                        gms->debug_patches, gms->debug_poke_ms);
+        }
         info_report("g9001: poking 0x%08x (%s%s) every 10 ms from %u ms",
                     gms->debug_poke_addr,
                     gms->debug_poke_hex ? gms->debug_poke_hex : "",
@@ -3092,6 +3124,19 @@ static void g9001_set_poke_hex(Object *obj, const char *value, Error **errp)
 
     g_free(gms->debug_poke_hex);
     gms->debug_poke_hex = g_strdup(value);
+}
+
+static char *g9001_get_patches(Object *obj, Error **errp)
+{
+    return g_strdup(G9001_MACHINE(obj)->debug_patches);
+}
+
+static void g9001_set_patches(Object *obj, const char *value, Error **errp)
+{
+    G9001MachineState *gms = G9001_MACHINE(obj);
+
+    g_free(gms->debug_patches);
+    gms->debug_patches = g_strdup(value);
 }
 
 static char *g9001_get_spi_image(Object *obj, Error **errp)
@@ -3405,6 +3450,12 @@ static void g9001_machine_instance_init(Object *obj)
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_set_description(obj, "debug-poke-ms",
                                     "Start the poke after this many ms");
+    object_property_add_str(obj, "debug-patches",
+                            g9001_get_patches, g9001_set_patches);
+    object_property_set_description(obj, "debug-patches",
+                                    "addr:hex;addr:hex list applied every 10 ms "
+                                    "(debug-poke-ms), e.g. "
+                                    "0x11E9EA24:0000;0x11FFC010:14");
     object_property_add_str(obj, "debug-poke-hex",
                             g9001_get_poke_hex, g9001_set_poke_hex);
     object_property_set_description(obj, "debug-poke-hex",
