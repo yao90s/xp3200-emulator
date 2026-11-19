@@ -27,6 +27,7 @@ typedef struct DisasContext {
     uint32_t addr_mask;
     bool slp_as_nop;
     bool trace_int;
+    bool resample_interrupts;
 } DisasContext;
 
 enum {
@@ -349,7 +350,10 @@ static void gen_set_sbc_flags(TCGv_i32 lhs, TCGv_i32 rhs,
 
 static void gen_goto_tb(DisasContext *ctx, unsigned n, vaddr dest)
 {
-    if (translator_use_goto_tb(&ctx->base, dest)) {
+    if (ctx->resample_interrupts) {
+        tcg_gen_movi_i32(cpu_pc, dest);
+        tcg_gen_exit_tb(NULL, 0);
+    } else if (translator_use_goto_tb(&ctx->base, dest)) {
         tcg_gen_goto_tb(n);
         tcg_gen_movi_i32(cpu_pc, dest);
         tcg_gen_exit_tb(ctx->base.tb, n);
@@ -360,30 +364,25 @@ static void gen_goto_tb(DisasContext *ctx, unsigned n, vaddr dest)
     ctx->base.is_jmp = DISAS_NORETURN;
 }
 
+static void gen_goto_register(DisasContext *ctx, TCGv_i32 dest)
+{
+    tcg_gen_mov_i32(cpu_pc, dest);
+    if (ctx->resample_interrupts) {
+        tcg_gen_exit_tb(NULL, 0);
+    } else {
+        tcg_gen_lookup_and_goto_ptr();
+    }
+    ctx->base.is_jmp = DISAS_NORETURN;
+}
+
 static void gen_branch_tb(DisasContext *ctx, TCGv_i32 cond, vaddr dest)
 {
     TCGLabel *fallthrough = gen_new_label();
 
     tcg_gen_brcondi_i32(TCG_COND_EQ, cond, 0, fallthrough);
-    if (translator_use_goto_tb(&ctx->base, dest)) {
-        tcg_gen_goto_tb(0);
-        tcg_gen_movi_i32(cpu_pc, dest);
-        tcg_gen_exit_tb(ctx->base.tb, 0);
-    } else {
-        tcg_gen_movi_i32(cpu_pc, dest);
-        tcg_gen_lookup_and_goto_ptr();
-    }
-
+    gen_goto_tb(ctx, 0, dest);
     gen_set_label(fallthrough);
-    if (translator_use_goto_tb(&ctx->base, ctx->base.pc_next)) {
-        tcg_gen_goto_tb(1);
-        tcg_gen_movi_i32(cpu_pc, ctx->base.pc_next);
-        tcg_gen_exit_tb(ctx->base.tb, 1);
-    } else {
-        tcg_gen_movi_i32(cpu_pc, ctx->base.pc_next);
-        tcg_gen_lookup_and_goto_ptr();
-    }
-    ctx->base.is_jmp = DISAS_NORETURN;
+    gen_goto_tb(ctx, 1, ctx->base.pc_next);
 }
 
 static void gen_unimplemented(DisasContext *ctx, uint16_t word)
@@ -405,6 +404,8 @@ static void gen_psr_bit(DisasContext *ctx, uint16_t word, bool set)
     }
     gen_helper_s1c33_write_psr(tcg_env, value, tcg_constant_i32(ctx->pc),
                                tcg_constant_i32(word));
+    ctx->resample_interrupts =
+        ((S1C33_PSR_IE | S1C33_PSR_IL_MASK) & (1u << bit)) != 0;
 }
 
 static int32_t s1c33_branch_disp(DisasContext *ctx, uint16_t word)
@@ -563,9 +564,7 @@ static void gen_ret(DisasContext *ctx, uint16_t word)
         }
     }
 
-    tcg_gen_mov_i32(cpu_pc, target);
-    tcg_gen_lookup_and_goto_ptr();
-    ctx->base.is_jmp = DISAS_NORETURN;
+    gen_goto_register(ctx, target);
 }
 
 static void gen_reti(DisasContext *ctx)
@@ -582,9 +581,8 @@ static void gen_reti(DisasContext *ctx)
     gen_clear_ext(ctx);
     gen_helper_s1c33_trace_branch(tcg_env, tcg_constant_i32(S1C33_TRACE_RETI),
                                   tcg_constant_i32(ctx->pc), target, psr);
-    tcg_gen_mov_i32(cpu_pc, target);
-    tcg_gen_lookup_and_goto_ptr();
-    ctx->base.is_jmp = DISAS_NORETURN;
+    ctx->resample_interrupts = true;
+    gen_goto_register(ctx, target);
 }
 
 static void gen_software_interrupt(DisasContext *ctx, uint16_t word)
@@ -714,9 +712,7 @@ static void gen_register_call_or_jump(DisasContext *ctx, uint16_t word,
         }
     }
 
-    tcg_gen_mov_i32(cpu_pc, target);
-    tcg_gen_lookup_and_goto_ptr();
-    ctx->base.is_jmp = DISAS_NORETURN;
+    gen_goto_register(ctx, target);
 }
 
 static void gen_ld_special_to_reg(DisasContext *ctx, uint16_t word)
@@ -747,6 +743,7 @@ static void gen_ld_reg_to_special(DisasContext *ctx, uint16_t word)
         gen_helper_s1c33_write_psr(tcg_env, cpu_regs[rs],
                                    tcg_constant_i32(ctx->pc),
                                    tcg_constant_i32(word));
+        ctx->resample_interrupts = true;
     } else {
         tcg_gen_mov_i32(dst, cpu_regs[rs]);
         if (sd == 8) {
@@ -1651,11 +1648,12 @@ static void translate_one(DisasContext *ctx, uint16_t word)
 static void s1c33_tr_init_disas_context(DisasContextBase *db, CPUState *cs)
 {
     DisasContext *ctx = container_of(db, DisasContext, base);
+    uint32_t flags = db->tb->flags;
 
     ctx->env = cpu_env(cs);
-    ctx->ext_count = MIN(ctx->env->ext_count, 2);
-    ctx->ext[0] = ctx->env->ext[0];
-    ctx->ext[1] = ctx->env->ext[1];
+    ctx->ext_count = extract32(flags, 0, S1C33_TB_EXT_COUNT_BITS);
+    ctx->ext[0] = extract32(flags, S1C33_TB_EXT0_SHIFT, S1C33_TB_EXT_VALUE_BITS);
+    ctx->ext[1] = extract32(flags, S1C33_TB_EXT1_SHIFT, S1C33_TB_EXT_VALUE_BITS);
 }
 
 static void s1c33_tr_tb_start(DisasContextBase *db, CPUState *cs)
@@ -1678,6 +1676,13 @@ static void s1c33_tr_translate_insn(DisasContextBase *db, CPUState *cs)
                                MO_LE);
     ctx->base.pc_next += 2;
     translate_one(ctx, word);
+    /*
+     * PSR can unmask an IRQ already asserted by the ITC. Return to the CPU
+     * loop after the instruction, or after its branch if it was a delay slot.
+     */
+    if (ctx->resample_interrupts && ctx->base.is_jmp == DISAS_NEXT) {
+        gen_goto_tb(ctx, 0, ctx->base.pc_next);
+    }
 }
 
 static void s1c33_tr_tb_stop(DisasContextBase *db, CPUState *cs)

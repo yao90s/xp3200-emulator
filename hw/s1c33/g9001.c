@@ -10,18 +10,28 @@
  */
 
 #include "qemu/osdep.h"
+#include <glib/gstdio.h>
 #include "qemu/bitops.h"
 #include "qemu/bswap.h"
+#include "qemu/crc-ccitt.h"
 #include "qemu/error-report.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
 #include "cpu.h"
 #include "exec/cpu-common.h"
 #include "exec/log.h"
+#include "exec/translation-block.h"
 #include "hw/core/boards.h"
 #include "hw/core/cpu.h"
 #include "hw/core/loader.h"
+#include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/sd/sd.h"
+#include "hw/ssi/ssi.h"
+#include "block/block.h"
+#include "qobject/qdict.h"
 #include "system/address-spaces.h"
+#include "system/block-backend.h"
 #include "system/memory.h"
 #include "system/runstate.h"
 #include "system/system.h"
@@ -31,6 +41,7 @@
 #include "ui/pixel_ops.h"
 
 #define TYPE_G9001_MACHINE   MACHINE_TYPE_NAME("g9001")
+#define TYPE_G9001_SPI_HOST  "g9001-spi-host"
 OBJECT_DECLARE_SIMPLE_TYPE(G9001MachineState, G9001_MACHINE)
 
 /*
@@ -80,16 +91,27 @@ OBJECT_DECLARE_SIMPLE_TYPE(G9001MachineState, G9001_MACHINE)
 #define G9001_DEFAULT_RAM       (32 * MiB)   /* the kernel size byte says 32 MB */
 #define G9001_BOOT_STACK_TOP    0x00003f80u
 
+#define G9001_MP3_VECTOR        0x00023000u
+#define G9001_MP3_ROM           0x00023100u
+#define G9001_MP3_IO            0x3f00
+#define G9001_MP3_CLIP_LIMIT    (1 * MiB)
+
 /* S1C33E08 internal I/O register addresses (Area 6). */
 #define G9001_IO_MISC_BOOT      0x000018   /* pMISC_BOOT */
 #define G9001_IO_INT_PK01L      0x000262   /* key input priority */
 #define G9001_IO_INT_PLCDC      0x000269   /* LCDC priority */
 #define G9001_IO_INT_EK01_EP03  0x000270
 #define G9001_IO_INT_E16T01     0x000272
+#define G9001_IO_INT_E16T45     0x000274
 #define G9001_IO_INT_ELCDC      0x000278
 #define G9001_IO_INT_FK01_FP03  0x000280
+#define G9001_IO_INT_FDMA       0x000281
 #define G9001_IO_INT_F16T01     0x000282
+#define G9001_IO_INT_F16T45     0x000284
 #define G9001_IO_INT_FLCDC      0x000288
+#define G9001_IO_INT_HSD23_TRIG 0x000299
+#define G9001_IO_INT_HSD_SWTRIG 0x00029a
+#define G9001_IO_INT_RSTONLY    0x00029f
 #define G9001_IO_CARDSETUP      0x000300   /* pCARDSETUP */
 #define G9001_IO_CARDFUNCSEL    0x000302   /* pCARDFUNCSEL05 */
 #define G9001_IO_ECC_TRIGSEL    0x000310
@@ -102,6 +124,8 @@ OBJECT_DECLARE_SIMPLE_TYPE(G9001MachineState, G9001_MACHINE)
 #define G9001_SDRAMC_INI_READY  0x18       /* init done + ready */
 #define G9001_IO_SDRAMC_CTL     0x001604
 #define G9001_IO_SDRAMC_REF     0x001608
+#define G9001_SDRAMC_REF_SELEN  0x80     /* byte at REF + 2 */
+#define G9001_SDRAMC_REF_SELDO  0x02     /* byte at REF + 3 */
 #define G9001_IO_SDRAMC_APP     0x001610
 #define G9001_IO_SRAMC_BCLK     0x001500
 #define G9001_IO_SRAMC_SWAIT    0x001504
@@ -115,9 +139,22 @@ OBJECT_DECLARE_SIMPLE_TYPE(G9001MachineState, G9001_MACHINE)
 #define G9001_IO_SPI_WAIT       0x001710
 #define G9001_IO_HS2_CNT    0x1140
 #define G9001_IO_HS2_CTL    0x1142
-#define G9001_IO_HS2_STAT   0x114b
+#define G9001_IO_HS2_EN     0x114c
+#define G9001_IO_HS2_TF     0x114e
 #define G9001_IO_HS2_SADR   0x1184
 #define G9001_IO_HS2_DADR   0x1188
+#define G9001_IO_HS3_CNT     0x1150
+#define G9001_IO_HS3_CTL     0x1152
+#define G9001_IO_HS3_SCTL    0x1157
+#define G9001_IO_HS3_DCTL    0x115b
+#define G9001_IO_HS3_EN      0x115c
+#define G9001_IO_HS3_TF      0x115e
+#define G9001_IO_HS3_ADV     0x1192
+#define G9001_IO_HS3_SADR    0x1194
+#define G9001_IO_HS3_DADR    0x1198
+#define G9001_IO_HS_MODE     0x119c
+#define G9001_HS2_BIT        BIT(2)
+#define G9001_HS3_BIT        BIT(3)
 
 #define G9001_IO_SPI_STAT       0x001714
 #define G9001_IO_SPI_INT        0x001718
@@ -143,9 +180,14 @@ OBJECT_DECLARE_SIMPLE_TYPE(G9001MachineState, G9001_MACHINE)
 #define G9001_IO_CMU_OPT        0x001b14
 #define G9001_IO_CMU_PROTECT    0x001b24
 #define G9001_IO_T16_0CA        0x000780   /* pT16_CA0 */
-#define G9001_IO_T16_0CB        0x000782   /* pT16_CB0 */
-#define G9001_IO_T16_0TC        0x000784   /* pT16_TC0 */
-#define G9001_IO_T16_0CTL       0x000786   /* pT16_CTL0 */
+#define G9001_IO_T16_4CA        0x0007a0   /* pT16_CA4 */
+#define G9001_IO_T16_5CA        0x0007a8   /* pT16_CA5 */
+#define G9001_IO_T16_5CLKCTL    0x0007ea   /* pT16_CLKCTL_5 */
+#define G9001_T16_5_INDEX       2
+#define G9001_T16_CB            2
+#define G9001_T16_TC            4
+#define G9001_T16_CTL           6
+#define G9001_T16_REGS          8
 #define G9001_IO_WDT            0x001830
 
 /* GPIO: PnD = 0x300380 + 2n, PnDIR = PnD + 1, Pxy function = 0x3003A0 + ... */
@@ -191,7 +233,9 @@ OBJECT_DECLARE_SIMPLE_TYPE(G9001MachineState, G9001_MACHINE)
 #define G9001_NAND_MAX_PAGE     4224
 #define G9001_NAND_SMALL_PAGE   512
 #define G9001_NAND_SMALL_OOB    16
-#define G9001_NAND_DEFAULT_ID   0xecda1095u
+#define G9001_NAND_DEFAULT_ID   0x20d35195u  /* NAND08GW3B2C */
+#define G9001_NAND_ID_BYTE5    0x58
+#define G9001_NAND_CE_PIN      (5 * 8 + 6)  /* P5.6 / #CE11, active low */
 
 #define G9001_TRACE_RING        64
 #define G9001_MMIO_TRACE_LEN    32
@@ -223,6 +267,7 @@ typedef struct G9001Nand {
     bool write_protected;
 
     uint8_t page[G9001_NAND_MAX_PAGE];
+    uint8_t program_page[G9001_NAND_MAX_PAGE];
     uint32_t page_size;             /* 2112 (boot) or 4224 (large page) */
     uint32_t data_size;             /* page_size - 64 */
     int64_t cached_page;            /* -1 when invalid */
@@ -264,6 +309,8 @@ typedef struct G9001MachineState {
     MachineState parent;
 
     char *nand_image_path;
+    char *audio_player;
+    char *audio_output;
     uint32_t nand_id;
     char *nand_bad_blocks;
     bool nand_save;
@@ -297,16 +344,24 @@ typedef struct G9001MachineState {
     char *debug_patches;            /* "addr:hex;addr:hex" list of patches */
     char *debug_copy_spec;          /* "dst:src:len", applied once */
     uint32_t debug_copy_ms;
+    bool debug_copy_once;           /* do not re-arm the copy timer */
+    uint32_t debug_copy_gate;       /* copy once this guest word becomes nonzero */
+    uint32_t debug_copy_until_addr; /* keep copying while this word == value ... */
+    uint32_t debug_copy_until_val;  /* ... and stop as soon as it changes */
+    bool debug_copy_until_set;
+    char *debug_load_spec;          /* "dst:path": load a host file into guest RAM */
     bool debug_poke_fast;           /* re-arm the poke timer every 0.2 ms */
     uint32_t debug_exit_on_stall_ms;
     char *debug_dump_path;
     char *debug_io_dump_path;       /* dump the internal IO image here */
     uint32_t debug_io_dump_ms;
     char *spi_image_path;
+    char *spi_card_type;
     char *mmc_cid_hex;
     char *mmc_csd_hex;
     uint32_t mmc_capacity_mb;
     bool debug_spi_test;
+    bool trace_spi;
     bool debug_force_event;
     bool debug_lcd_test;
     uint32_t nand_cle_pin;          /* port * 8 + bit, 0xffffffff = not wired */
@@ -335,9 +390,12 @@ typedef struct G9001T16 {
 
 typedef struct G9001Mmc {
     int fd;
-    uint64_t size;                  /* image size in bytes */
-    uint32_t capacity_mb;
-    bool high_capacity;
+    uint32_t sectors;
+    bool idle;
+    bool multi_read;
+    uint32_t next_lba;
+    uint32_t block_count;
+    uint32_t blocks_left;
 
     uint8_t cid[16];
     uint8_t csd[16];
@@ -345,54 +403,54 @@ typedef struct G9001Mmc {
     /* command collection */
     uint8_t cmd[6];
     unsigned cmd_len;
-    bool cmd_active;
-
-    /* response (CID/CSD replies are 1 + 16 bytes) */
-    uint8_t resp[24];
+    /* Response delay, R1, data token, data block and CRC16. */
+    uint8_t resp[1 + 1 + 1 + 1 + 512 + 2];
     unsigned resp_len;
     unsigned resp_pos;
-
-    /* data streaming */
-    bool data_out;
-    uint64_t data_lba;
-    uint32_t data_left;
-    bool data_token_sent;
-    bool data_crc_sent;
-    uint64_t xfers;
 } G9001Mmc;
 
 typedef struct G9001Spi {
     uint32_t rxd;
-    uint32_t txd;
     uint32_t ctl1;
-    uint32_t ctl2;
-    uint32_t wait;
-    uint32_t int_en;
-    uint32_t rxmk;
     bool rxd_valid;
+    bool selected;
+    SSIBus *sd_bus;
+    qemu_irq sd_cs;
 } G9001Spi;
 
 #define G9001_SPI_CTL1_BPT_SHIFT 10
-#define G9001_SPI_CTL1_BPT_MASK  0x1fu
-#define G9001_SPI_STAT_BSYF      (1u << 6)
+#define G9001_SPI_CTL1_ENA       BIT(0)
 #define G9001_SPI_STAT_TDEF      (1u << 4)
-#define G9001_SPI_STAT_RDOF      (1u << 3)
 #define G9001_SPI_STAT_RDFF      (1u << 2)
 
-#define G9001_MMC_DATA_TOKEN     0xfe
-#define G9001_MMC_START_TOKEN    0xfe
-#define G9001_MMC_IDLE_TOKEN     0xff
+#define G9001_SPI_SECTOR_SIZE    512
+#define G9001_SPI_CS_PORT        5
+#define G9001_SPI_CS            BIT(4)
+#define G9001_SPI_CD            BIT(1)
 
+
+typedef struct G9001Mp3 {
+    GByteArray *clip;
+    uint32_t buffer;
+    uint32_t size;
+    uint32_t transfer;
+    uint32_t event;
+    int32_t status;
+    bool collecting;
+} G9001Mp3;
 
 typedef struct G9001State {
     uint8_t io[G9001_IO_SIZE];
     uint8_t lcdc_seen[G9001_IO_SIZE];
-    uint8_t port_prev[G9001_KEY_PORTS];
     bool lcd_dirty;
     bool trace_io;
     bool poke_fast;
     bool copy_done;
+    bool copy_did_run;
     QEMUTimer *copy_timer;
+    uint32_t loadfile_addr;
+    char *loadfile_path;
+    QEMUTimer *loadfile_timer;
     uint32_t copy_period_ms;
     bool trace_nand;
     bool trace_nand_latch;
@@ -453,14 +511,17 @@ typedef struct G9001State {
     G9001Spi spi;
     G9001Mmc mmc;
 
-    /* 16-bit timer channel 0 (system tick source) */
-    G9001T16 t16;
+    /* System tick, LCD and keyboard timers. */
+    G9001T16 t16[3];
     QEMUTimer *t16_timer;
     uint32_t t16_hz;
 
+    G9001Mp3 mp3;
+
     /* keyboard */
-    uint8_t key_state[G9001_KEY_COLS][G9001_KEY_ROWS];
-    uint8_t key_col_drive;
+    uint8_t key_rows_by_column[G9001_KEY_COLS];
+    uint8_t key_irq_levels[2];
+    bool host_key_down[Q_KEY_CODE__MAX];
 
     /* tracing */
     G9001TraceEntry trace[G9001_TRACE_RING];
@@ -500,6 +561,7 @@ static G9001State *g9001_active = NULL;
 static uint8_t g9001_port_data(G9001State *s, unsigned port);
 static uint8_t g9001_port_dir(G9001State *s, unsigned port);
 static uint8_t g9001_port_pins(G9001State *s, unsigned port);
+static void g9001_update_irq(G9001State *s);
 static void g9001_lcd_paint_test(G9001State *s);
 static bool g9001_pin_level(G9001State *s, uint32_t pin);
 
@@ -736,6 +798,8 @@ static void g9001_nand_store_page(G9001State *s)
 static void g9001_nand_reset(G9001State *s)
 {
     G9001Nand *n = &s->nand;
+    uint32_t id = s->machine != NULL ? G9001_MACHINE(s->machine)->nand_id :
+                  G9001_NAND_DEFAULT_ID;
 
     n->cmd = 0xff;
     n->phase = G9001_NAND_IDLE;
@@ -746,15 +810,12 @@ static void g9001_nand_reset(G9001State *s)
     n->data_end = 0;
     n->program_loaded = false;
     n->ready_low = false;
-    n->id_len = 4;
-    n->id[0] = (s->machine != NULL ?
-                G9001_MACHINE(s->machine)->nand_id : G9001_NAND_DEFAULT_ID) >> 24;
-    n->id[1] = (s->machine != NULL ?
-                G9001_MACHINE(s->machine)->nand_id : G9001_NAND_DEFAULT_ID) >> 16;
-    n->id[2] = (s->machine != NULL ?
-                G9001_MACHINE(s->machine)->nand_id : G9001_NAND_DEFAULT_ID) >> 8;
-    n->id[3] = (s->machine != NULL ?
-                G9001_MACHINE(s->machine)->nand_id : G9001_NAND_DEFAULT_ID);
+    n->id_len = id == G9001_NAND_DEFAULT_ID ? sizeof(n->id) : 4;
+    n->id[0] = id >> 24;
+    n->id[1] = id >> 16;
+    n->id[2] = id >> 8;
+    n->id[3] = id;
+    n->id[4] = G9001_NAND_ID_BYTE5;
     n->id_ptr = 0;
     if (n->page_size == 0) {
         n->page_size = G9001_NAND_RAW_PAGE;
@@ -937,6 +998,12 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
     G9001Nand *n = &s->nand;
 
     if (command) {
+        if (*value == 0x10 && n->phase == G9001_NAND_PROGRAM &&
+            n->program_loaded) {
+            memcpy(n->page, n->program_page, n->page_size);
+            n->page_dirty = true;
+            g9001_nand_store_page(s);
+        }
         n->cmd = *value;
         n->data_ptr = 0;
         n->program_loaded = false;
@@ -954,7 +1021,7 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
             g9001_nand_latch_addr(s);
             g9001_nand_load_page(s, n->row);
             n->data_ptr = n->col;
-        n->raw_stream = g9001_nand_raw_col(s);
+            n->raw_stream = g9001_nand_raw_col(s);
             n->data_end = g9001_nand_stream_size(n);
             n->phase = G9001_NAND_READ;
             break;
@@ -963,32 +1030,41 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
             n->addr_count = 0;
             break;
         case 0x10:
-            g9001_nand_latch_addr(s);
-            g9001_nand_load_page(s, n->row);
-            n->data_ptr = n->col;
-        n->raw_stream = g9001_nand_raw_col(s);
-            n->data_end = g9001_nand_stream_size(n);
             n->phase = G9001_NAND_STATUS;
             break;
         case 0x60:
             n->phase = G9001_NAND_ERASE;
             n->addr_count = 0;
             break;
-        case 0xd0:
-            if (n->addr_count >= 3) {
-                if (n->addr_count >= 5) {
-                    n->row = n->addr[2] | (n->addr[3] << 8) |
-                             ((n->addr[4] & 0x0f) << 16);
-                } else {
-                    n->row = n->addr[1] | (n->addr[2] << 8);
-                }
+        case 0xd0: {
+            uint32_t base;
+            uint32_t i;
+
+            if (n->phase != G9001_NAND_ERASE || n->addr_count != 3) {
+                n->phase = G9001_NAND_STATUS;
+                break;
             }
-            g9001_nand_load_page(s, n->row & ~(G9001_NAND_PAGES_BLOCK - 1));
-            memset(n->page, 0xff, sizeof(n->page));
-            n->page_dirty = true;
-            g9001_nand_store_page(s);
+            /* Block erase transmits three row bytes and no column. */
+            n->row = n->addr[0] | (n->addr[1] << 8) |
+                     ((n->addr[2] & 0x0f) << 16);
+            /*
+             * Erase acts on the whole block, not just its first page: the
+             * firmware's FAT layer erases a block and then reads every page
+             * back expecting 0xFF, so a single-page erase makes it report
+             * "FatBid erase physical N block" and abort the boot.
+             */
+            base = n->row & ~(G9001_NAND_PAGES_BLOCK - 1);
+            for (i = 0; i < G9001_NAND_PAGES_BLOCK; i++) {
+                if (!g9001_nand_load_page(s, base + i)) {
+                    continue;
+                }
+                memset(n->page, 0xff, sizeof(n->page));
+                n->page_dirty = true;
+                g9001_nand_store_page(s);
+            }
             n->phase = G9001_NAND_STATUS;
             break;
+        }
         case 0x70:
             n->phase = G9001_NAND_STATUS;
             break;
@@ -1043,23 +1119,25 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
             if (n->addr_count >= 3) {
                 g9001_nand_latch_addr(s);
                 n->data_ptr = n->col;
-        n->raw_stream = g9001_nand_raw_col(s);
-                g9001_nand_load_page(s, n->row);
+                n->raw_stream = g9001_nand_raw_col(s);
+                n->program_loaded = g9001_nand_load_page(s, n->row);
+                if (n->program_loaded) {
+                    memcpy(n->program_page, n->page, n->page_size);
+                }
+            }
+            if (!n->program_loaded) {
+                break;
             }
             if (n->raw_stream) {
                 if (n->data_ptr < n->page_size) {
-                    n->page[n->data_ptr] = *value;
-                    n->page_dirty = true;
-                    n->program_loaded = true;
+                    n->program_page[n->data_ptr] &= *value;
                 }
                 n->data_ptr++;
             } else if (n->data_ptr < g9001_nand_stream_size(n)) {
                 unsigned off = g9001_nand_stream_offset(n, n->data_ptr);
 
                 if (off < n->page_size) {
-                    n->page[off] = *value;
-                    n->page_dirty = true;
-                    n->program_loaded = true;
+                    n->program_page[off] &= *value;
                 }
                 n->data_ptr++;
             }
@@ -1135,8 +1213,8 @@ static void g9001_nand_byte(G9001State *s, bool command, bool address,
 }
 
 /*
- * The card interface is a plain memory window; CLE/ALE are GPIO pins and
- * #CE/#RE/#WE come from the bus.  Three windows are mapped because the
+ * The card interface is a plain memory window; CLE/ALE and the board's NAND
+ * select are GPIO pins. Three windows are mapped because the
  * firmware moves the decode with pCARDSETUP:
  *   #CE4  -> Area 4  (0x00100000, 1 MiB)     - boot ROM / MBR default
  *   #CE11 -> Area 11 (0x01000000, 8 MiB)     - what the kernel selects (0x03)
@@ -1159,6 +1237,11 @@ static uint64_t g9001_card_read_win(G9001State *s, G9001CardWin win,
     bool cle = g9001_pin_level(s, gms->nand_cle_pin);
     bool ale = g9001_pin_level(s, gms->nand_ale_pin);
     unsigned i;
+
+    /* The firmware also probes other chip selects on the same data bus. */
+    if (g9001_pin_level(s, G9001_NAND_CE_PIN)) {
+        return MAKE_64BIT_MASK(0, size * 8);
+    }
 
     if (win != G9001_CARD_WIN_4 && !s->card_win_seen[win]) {
         s->card_win_seen[win] = true;
@@ -1206,6 +1289,10 @@ static void g9001_card_write_win(G9001State *s, G9001CardWin win,
     bool cle = g9001_pin_level(s, gms->nand_cle_pin);
     bool ale = g9001_pin_level(s, gms->nand_ale_pin);
     unsigned i;
+
+    if (g9001_pin_level(s, G9001_NAND_CE_PIN)) {
+        return;
+    }
 
     if (win != G9001_CARD_WIN_4 && !s->card_win_seen[win]) {
         s->card_win_seen[win] = true;
@@ -1312,18 +1399,29 @@ static unsigned g9001_lcd_bpp(G9001State *s)
     case 3:
         return 8;
     default:
+        /* The firmware's 0x80000014 selects the G9001 4bpp framebuffer. */
         return G9001_LCD_BPP;
     }
 }
 
-static unsigned g9001_lcd_stride(G9001State *s, unsigned bpp)
+static unsigned g9001_lcd_stride(G9001State *s)
 {
-    uint32_t mladd = g9001_lcdc32(s, G9001_IO_LCDC_MLADD);
+    unsigned words = extract32(g9001_lcdc32(s, G9001_IO_LCDC_MLADD), 0, 10);
 
-    if (mladd != 0 && mladd <= 4096) {
-        return mladd;
+    return words ? words * 4 : G9001_LCD_STRIDE;
+}
+
+static uint8_t g9001_lcd_read_pixel(const uint8_t *row, unsigned x,
+                                    unsigned bpp)
+{
+    unsigned bit = x * bpp;
+    unsigned shift = 8 - bpp - (bit & 7);
+
+    /* In G9001 4bpp VRAM, the low nibble is the left pixel. */
+    if (bpp == 4) {
+        shift = bit & 7;
     }
-    return G9001_LCD_STRIDE;
+    return extract32(row[bit >> 3], shift, bpp);
 }
 
 static uint8_t g9001_lcd_gray(G9001State *s, uint8_t pixel, unsigned bpp)
@@ -1388,42 +1486,51 @@ static void g9001_lcd_store_pixel(DisplaySurface *surface, int x, int y,
     }
 }
 
-static const uint8_t *g9001_lcd_vram(G9001State *s)
+static const uint8_t *g9001_lcd_vram(G9001State *s, unsigned stride,
+                                     unsigned bpp)
 {
     uint32_t madd = g9001_lcdc32(s, G9001_IO_LCDC_MADD);
-    uint64_t off;
+    size_t row_bytes = DIV_ROUND_UP(G9001_LCD_WIDTH * bpp, 8);
+    size_t size = (G9001_LCD_HEIGHT - 1) * stride + row_bytes;
 
-    if (s->sdram_ptr == NULL) {
+    if (s->sdram_ptr == NULL || stride < row_bytes ||
+        madd < G9001_SDRAM_BASE ||
+        madd - G9001_SDRAM_BASE > G9001_DEFAULT_RAM - size) {
         return NULL;
     }
-    if (madd < G9001_SDRAM_BASE ||
-        madd >= G9001_SDRAM_BASE + G9001_DEFAULT_RAM) {
-        return NULL;
-    }
-    off = madd - G9001_SDRAM_BASE;
-    return s->sdram_ptr + off;
+    return s->sdram_ptr + (madd - G9001_SDRAM_BASE);
 }
 
 static void g9001_lcd_update(void *opaque)
 {
     G9001State *s = opaque;
     DisplaySurface *surface = qemu_console_surface(s->con);
-    const uint8_t *vram = g9001_lcd_vram(s);
+    unsigned bpp = g9001_lcd_bpp(s);
+    unsigned stride = g9001_lcd_stride(s);
+    const uint8_t *vram = g9001_lcd_vram(s, stride, bpp);
     uint32_t colors[1 << G9001_LCD_MAX_BPP];
-    unsigned bpp;
-    unsigned stride;
     unsigned x;
     unsigned y;
 
-    if (surface == NULL || surface_bits_per_pixel(surface) == 0 ||
-        vram == NULL || !g9001_lcd_on(s)) {
+    if (surface == NULL || surface_bits_per_pixel(surface) == 0) {
         return;
     }
-    bpp = g9001_lcd_bpp(s);
-    if (bpp > G9001_LCD_MAX_BPP) {
-        bpp = 4;
+    if (!g9001_lcd_on(s)) {
+        if (s->lcd_dirty) {
+            pixman_color_t white = { 0xffff, 0xffff, 0xffff, 0xffff };
+            pixman_rectangle16_t panel = { 0, 0, G9001_LCD_WIDTH,
+                                           G9001_LCD_HEIGHT };
+
+            pixman_image_fill_rectangles(PIXMAN_OP_SRC, surface->image,
+                                         &white, 1, &panel);
+            dpy_gfx_update(s->con, 0, 0, G9001_LCD_WIDTH, G9001_LCD_HEIGHT);
+            s->lcd_dirty = false;
+        }
+        return;
     }
-    stride = g9001_lcd_stride(s, bpp);
+    if (vram == NULL) {
+        return;
+    }
     for (x = 0; x < (1u << bpp); x++) {
         colors[x] = g9001_lcd_pixel(surface, g9001_lcd_gray(s, x, bpp));
     }
@@ -1432,10 +1539,7 @@ static void g9001_lcd_update(void *opaque)
         const uint8_t *row = vram + (size_t)y * stride;
 
         for (x = 0; x < G9001_LCD_WIDTH; x++) {
-            unsigned bit = x * bpp;
-            uint8_t byte = row[bit >> 3];
-            unsigned shift = 8 - bpp - (bit & 7);
-            uint8_t pixel = (byte >> shift) & ((1u << bpp) - 1);
+            uint8_t pixel = g9001_lcd_read_pixel(row, x, bpp);
 
             g9001_lcd_store_pixel(surface, x, y, colors[pixel]);
         }
@@ -1537,6 +1641,64 @@ static void g9001_io_dump(void *opaque)
     }
 }
 
+/*
+ * Device-side writes into guest RAM do NOT go through the CPU's store path, so the
+ * TCG translation cache is not invalidated automatically.  Any injected code would
+ * therefore keep running the previously translated block.  Flush the range
+ * explicitly after every diagnostic write.
+ */
+static void g9001_flush_tb(uint32_t start, uint32_t len)
+{
+    CPUState *cpu = qemu_get_cpu(0);
+
+    if (cpu == NULL || len == 0) {
+        return;
+    }
+    tb_invalidate_phys_range(cpu, (tb_page_addr_t)start,
+                             (tb_page_addr_t)(start + len - 1));
+}
+
+static void g9001_load_host_file(G9001State *s, uint32_t dst, const char *path);
+
+/* Timed variant of debug-load-file: drop a host file in at a chosen virtual time. */
+static void g9001_loadfile_cb(void *opaque)
+{
+    G9001State *s = opaque;
+
+    if (s->loadfile_path == NULL) {
+        return;
+    }
+    g9001_load_host_file(s, s->loadfile_addr, s->loadfile_path);
+    g_clear_pointer(&s->loadfile_path, g_free);
+}
+
+/* Load a host file straight into guest RAM (diagnostic what-if knob). */
+static void g9001_load_host_file(G9001State *s, uint32_t dst, const char *path)
+{
+    gchar *data = NULL;
+    gsize len = 0;
+    GError *err = NULL;
+
+    if (!g_file_get_contents(path, &data, &len, &err)) {
+        error_report("g9001: cannot read '%s': %s", path,
+                     err ? err->message : "unknown error");
+        if (err != NULL) {
+            g_error_free(err);
+        }
+        return;
+    }
+    if (len == 0 || len > 16 * 1024 * 1024) {
+        error_report("g9001: '%s' has unusable size %zu", path, len);
+        g_free(data);
+        return;
+    }
+    address_space_write(&address_space_memory, (hwaddr)dst,
+                        MEMTXATTRS_UNSPECIFIED, (const uint8_t *)data, len);
+    g9001_flush_tb(dst, (uint32_t)len);
+    info_report("g9001: loaded %zu bytes from '%s' at 0x%x", len, path, dst);
+    g_free(data);
+}
+
 /* One-shot block copy inside guest RAM (diagnostic what-if knob). */
 static void g9001_copy_cb(void *opaque)
 {
@@ -1569,14 +1731,65 @@ static void g9001_copy_cb(void *opaque)
         error_report("g9001: bad debug-copy spec '%s'", gms->debug_copy_spec);
         return;
     }
+    /*
+     * Optional stop condition, checked BEFORE copying so a copy never races with
+     * the firmware's own relocation: keep copying while the guest word at
+     * debug_copy_until_addr still equals the expected value, and stop (without
+     * copying) as soon as it changes.
+     */
+    if (gms->debug_copy_until_set && s->copy_did_run) {
+        uint32_t cur = 0;
+
+        address_space_read(&address_space_memory,
+                           (hwaddr)gms->debug_copy_until_addr,
+                           MEMTXATTRS_UNSPECIFIED, &cur, 4);
+        if (cur != gms->debug_copy_until_val) {
+            info_report("g9001: copy stop: 0x%x is 0x%x (expected 0x%x) at %" PRId64
+                        " ms", gms->debug_copy_until_addr, cur,
+                        gms->debug_copy_until_val,
+                        qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
+            return;                     /* do not re-arm: stop for good */
+        }
+    }
+    /*
+     * Optional state gate: wait until the guest word at debug_copy_gate is
+     * nonzero (i.e. the firmware has written its own data there) *and* the
+     * source's first word is nonzero (i.e. the payload has arrived).  This
+     * makes the copy independent of wall/virtual clock pacing.
+     */
+    if (gms->debug_copy_gate != 0) {
+        uint32_t gate_v = 0, src_v = 0;
+
+        address_space_read(&address_space_memory, (hwaddr)gms->debug_copy_gate,
+                           MEMTXATTRS_UNSPECIFIED, &gate_v, 4);
+        address_space_read(&address_space_memory, (hwaddr)src,
+                           MEMTXATTRS_UNSPECIFIED, &src_v, 4);
+        if (gate_v == 0) {
+            timer_mod(s->copy_timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                      (s->copy_period_ms ? s->copy_period_ms : 1));
+            return;
+        }
+        if (src_v == 0) {       /* payload not in place yet: keep waiting */
+            timer_mod(s->copy_timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) +
+                      (s->copy_period_ms ? s->copy_period_ms : 1));
+            return;
+        }
+        info_report("g9001: debug-copy gate 0x%x opened", gms->debug_copy_gate);
+    }
     buf = g_malloc(len);
     address_space_read(&address_space_memory, (hwaddr)src,
                        MEMTXATTRS_UNSPECIFIED, buf, len);
     address_space_write(&address_space_memory, (hwaddr)dst,
                         MEMTXATTRS_UNSPECIFIED, buf, len);
+    g9001_flush_tb((uint32_t)dst, (uint32_t)len);
     g_free(buf);
-    info_report("g9001: copied %lu bytes 0x%lx -> 0x%lx", len, src, dst);
-    if (s->copy_timer != NULL && s->copy_period_ms != 0) {
+    info_report("g9001: copied %lu bytes 0x%lx -> 0x%lx (at %" PRId64 " ms)",
+                len, src, dst, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL));
+    s->copy_did_run = true;
+    if (s->copy_timer != NULL && s->copy_period_ms != 0 &&
+        !gms->debug_copy_once) {
         timer_mod(s->copy_timer,
                   qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + s->copy_period_ms);
     }
@@ -1642,14 +1855,13 @@ static void g9001_poke_cb(void *opaque)
 
 static void g9001_lcd_dump_pgm(G9001State *s, const char *path)
 {
-    const uint8_t *vram = g9001_lcd_vram(s);
+    unsigned bpp = g9001_lcd_bpp(s);
+    unsigned stride = g9001_lcd_stride(s);
+    const uint8_t *vram = g9001_lcd_vram(s, stride, bpp);
     g_autofree char *header = NULL;
     g_autofree uint8_t *image = NULL;
-    unsigned bpp;
-    unsigned stride;
     unsigned x;
     unsigned y;
-    unsigned used[1 << G9001_LCD_MAX_BPP] = { 0 };
     GError *gerr = NULL;
 
     if (path == NULL || path[0] == 0) {
@@ -1659,29 +1871,20 @@ static void g9001_lcd_dump_pgm(G9001State *s, const char *path)
         info_report("g9001-lcd: no VRAM (MADD=0x%08x); dumping white",
                     g9001_lcdc32(s, G9001_IO_LCDC_MADD));
     }
-    bpp = g9001_lcd_bpp(s);
-    if (bpp > G9001_LCD_MAX_BPP) {
-        bpp = 4;
-    }
-    stride = g9001_lcd_stride(s, bpp);
     header = g_strdup_printf("P5\n%u %u\n255\n", G9001_LCD_WIDTH,
                              G9001_LCD_HEIGHT);
     image = g_malloc(G9001_LCD_WIDTH * G9001_LCD_HEIGHT);
 
     for (y = 0; y < G9001_LCD_HEIGHT; y++) {
+        const uint8_t *row = vram ? vram + (size_t)y * stride : NULL;
+
         for (x = 0; x < G9001_LCD_WIDTH; x++) {
-            uint8_t pixel = 0;
+            uint8_t gray = 255;
 
-            if (vram != NULL) {
-                const uint8_t *row = vram + (size_t)y * stride;
-                unsigned bit = x * bpp;
-                uint8_t byte = row[bit >> 3];
-                unsigned shift = 8 - bpp - (bit & 7);
-
-                pixel = (byte >> shift) & ((1u << bpp) - 1);
+            if (row) {
+                gray = g9001_lcd_gray(s, g9001_lcd_read_pixel(row, x, bpp), bpp);
             }
-            used[pixel & 0xf]++;
-            image[y * G9001_LCD_WIDTH + x] = g9001_lcd_gray(s, pixel, bpp);
+            image[y * G9001_LCD_WIDTH + x] = gray;
         }
     }
 
@@ -1748,7 +1951,7 @@ static void g9001_pc_sample_cb(void *opaque)
                 s->a0ram_ptr != NULL ? s->a0ram_ptr[0x3f3] : 0,
                 s->card_reads, s->card_writes, s->nand_max_row,
                 s->nand_programs,
-                s->t16.ctl, s->t16.counter, s->t16.ca, s->t16.cb,
+                s->t16[0].ctl, s->t16[0].counter, s->t16[0].ca, s->t16[0].cb,
                 s->io[G9001_IO_INT_E16T01], s->io[0x0266],
                 s->io[0x0282]);
     timer_mod(s->pc_sample_timer,
@@ -1799,39 +2002,20 @@ static uint8_t g9001_port_dir(G9001State *s, unsigned port)
     return s->io[G9001_IO_PORT_BASE + port * 2 + 1];
 }
 
-static unsigned g9001_driven_column(G9001State *s)
+static uint8_t g9001_row_inputs(G9001State *s)
 {
-    unsigned col;
+    uint8_t driven_rows = 0;
 
-    for (col = 0; col < G9001_KEY_COLS; col++) {
+    for (unsigned col = 0; col < G9001_KEY_COLS; col++) {
         unsigned port = g9001_key_col_pin[col].port;
         unsigned bit = g9001_key_col_pin[col].bit;
 
-        if (!(g9001_port_dir(s, port) & (1u << bit))) {
-            continue;           /* not an output: cannot drive the matrix */
-        }
-        if (!(g9001_port_data(s, port) & (1u << bit))) {
-            return col;         /* active low */
+        if ((g9001_port_dir(s, port) & BIT(bit)) &&
+            !(g9001_port_data(s, port) & BIT(bit))) {
+            driven_rows |= s->key_rows_by_column[col];
         }
     }
-    return G9001_KEY_COLS;
-}
-
-static uint8_t g9001_row_inputs(G9001State *s)
-{
-    uint8_t rows = 0xff;
-    unsigned col = g9001_driven_column(s);
-    unsigned row;
-
-    if (col >= G9001_KEY_COLS) {
-        return rows;
-    }
-    for (row = 0; row < G9001_KEY_ROWS; row++) {
-        if (s->key_state[col][row]) {
-            rows &= ~(1u << row);
-        }
-    }
-    return rows;
+    return ~driven_rows;
 }
 
 /* Map the eight row lines onto P6/P7 exactly like the scan routine does. */
@@ -1845,6 +2029,18 @@ static uint8_t g9001_port_pins(G9001State *s, unsigned port)
     uint32_t byby = gms->nand_ryby_pin;
     unsigned i;
 
+    /* The low-power hand-off waits for the active-high input at P8.0 to drop. */
+    if (port == 8) {
+        in &= ~BIT(0);
+    }
+    /* SDCardDetect samples the active-low socket switch on P0.1. */
+    if (port == 0 && (s->mmc.fd >= 0 || s->spi.sd_bus)) {
+        in &= ~G9001_SPI_CD;
+    }
+    /* P5.7 is the NAND boot page-size strap (E08 manual D.2). */
+    if (port == 5 && gms->nand_small_page) {
+        in &= ~BIT(7);
+    }
     for (i = 0; i < G9001_KEY_ROWS; i++) {
         unsigned rport = g9001_key_row_pin[i].port;
         unsigned rbit = g9001_key_row_pin[i].bit;
@@ -1875,240 +2071,355 @@ static uint8_t g9001_port_pins(G9001State *s, unsigned port)
     return out | (in & ~dir);
 }
 
+static void g9001_key_irq_sample(G9001State *s, bool detect_edges)
+{
+    /* E08 manual VI.1.6.3: the two key interrupt input multiplexers. */
+    static const uint8_t ports[2][8] = {
+        { 0, 1, 2, 4, 6, 5, 8, 9 },
+        { 0, 1, 2, 3, 6, 7, 8, 9 },
+    };
+    static const uint8_t shifts[] = { 4, 4, 4, 0, 4, 0, 4, 4 };
+    uint8_t flags = 0;
+
+    for (unsigned bank = 0; bank < 2; bank++) {
+        unsigned sel = extract32(s->io[G9001_IO_KEYINTSEL], 4 * bank, 3);
+        unsigned shift = bank ? shifts[sel] : 0;
+        uint8_t width_mask = bank ? (sel == 6 ? 0x03 : 0x0f) : 0x1f;
+        uint8_t level = g9001_port_pins(s, ports[bank][sel]) >> shift;
+        uint8_t old = s->key_irq_levels[bank];
+        uint8_t cmp = s->io[G9001_IO_KEYCMP0 + bank];
+        uint8_t mask = s->io[G9001_IO_KEYMASK0 + bank] & width_mask;
+
+        s->key_irq_levels[bank] = level;
+        if (detect_edges && ((old ^ level) & ~(old ^ cmp) & mask)) {
+            flags |= BIT(4 + bank);
+        }
+    }
+    if (flags) {
+        s->io[G9001_IO_INT_FK01_FP03] |= flags;
+        g9001_update_irq(s);
+    }
+}
+
 /* ------------------------------------------------------------------------- */
 /* SPI + MMC/SD card (E08 SPI module at 0x301700, SPI mode card)             */
 /* ------------------------------------------------------------------------- */
 
-/*
- * The firmware talks to the dictionary MMC card through the E08 SPI module:
- * write TXD -> the hardware shifts (BPT+1) bits out and back, read RXD.
- * CS is a GPIO pin, so the model only has to answer byte-by-byte.
- *
- * CID/CSD are configurable because card identity is exactly what the
- * "why does a cloned card not work" investigation needs to vary.
- */
-static void g9001_mmc_default_identity(G9001Mmc *m)
+/* SPI SD cards use QEMU's SSI SD model. The dictionary card uses legacy MMC
+ * commands and a raw image whose capacity is not a power of two. */
+static void g9001_sd_open(G9001State *s, const char *path)
 {
+    G9001Spi *spi = &s->spi;
+    QDict *options = qdict_new();
+    BlockBackend *blk;
+    DeviceState *host = qdev_new(TYPE_G9001_SPI_HOST);
+    DeviceState *adapter;
+    DeviceState *card = qdev_new(TYPE_SD_CARD_SPI);
+
+    qdict_put_str(options, "driver", "raw");
+    blk = blk_new_open(path, NULL, options, BDRV_O_RDWR, &error_fatal);
+    object_property_add_child(OBJECT(s->machine), "spi-host", OBJECT(host));
+    spi->sd_bus = ssi_create_bus(host, "spi");
+    qdev_realize_and_unref(host, NULL, &error_fatal);
+    adapter = ssi_create_peripheral(spi->sd_bus, "ssi-sd");
+    spi->sd_cs = qdev_get_gpio_in_named(adapter, SSI_GPIO_CS, 0);
+    qemu_set_irq(spi->sd_cs, 1);
+    qdev_prop_set_drive_err(card, "drive", blk, &error_fatal);
+    qdev_realize_and_unref(card, qdev_get_child_bus(adapter, "sd-bus"),
+                           &error_fatal);
+    blk_unref(blk);
+}
+
+static uint8_t g9001_mmc_identity_crc(const uint8_t *bytes)
+{
+    uint8_t crc = 0;
+    unsigned i, bit;
+
+    for (i = 0; i < 15; i++) {
+        uint8_t value = bytes[i];
+
+        for (bit = 0; bit < 8; bit++) {
+            crc = (crc << 1) ^ (((crc ^ value) & 0x80) ? 0x12 : 0);
+            value <<= 1;
+        }
+    }
+    return crc | 1;
+}
+
+static void g9001_mmc_set_csd(G9001Mmc *m, uint32_t sectors)
+{
+    uint32_t c_size;
+    unsigned mult = 0;
+    unsigned unit = 4;
+
+    while (mult < 7 && (sectors % unit || sectors / unit > 4096)) {
+        mult++;
+        unit <<= 1;
+    }
+    if (sectors % unit || sectors < unit || sectors / unit > 4096) {
+        error_report("g9001: MMC capacity (%u sectors) cannot be encoded "
+                     "with 512-byte blocks; set mmc-csd-hex to override",
+                     sectors);
+        exit(EXIT_FAILURE);
+    }
+
+    c_size = sectors / unit - 1;
+    m->csd[5] = (m->csd[5] & 0xf0) | 9;
+    m->csd[6] = (m->csd[6] & 0xfc) | (c_size >> 10);
+    m->csd[7] = c_size >> 2;
+    m->csd[8] = (m->csd[8] & 0x3f) | ((c_size & 3) << 6);
+    m->csd[9] = (m->csd[9] & 0xfc) | (mult >> 1);
+    m->csd[10] = (m->csd[10] & 0x7f) | ((mult & 1) << 7);
+    m->csd[14] |= BIT(5);  /* PERM_WRITE_PROTECT for this read-only image */
+    m->csd[15] = g9001_mmc_identity_crc(m->csd);
+}
+
+static bool g9001_mmc_parse_identity(uint8_t *id, const char *hex)
+{
+    uint8_t bytes[16];
+    unsigned i;
+
+    if (strlen(hex) != sizeof(bytes) * 2) {
+        return false;
+    }
+    for (i = 0; i < sizeof(bytes); i++) {
+        int hi = g_ascii_xdigit_value(hex[2 * i]);
+        int lo = g_ascii_xdigit_value(hex[2 * i + 1]);
+
+        if (hi < 0 || lo < 0) {
+            return false;
+        }
+        bytes[i] = (hi << 4) | lo;
+    }
+    memcpy(id, bytes, sizeof(bytes));
+    return true;
+}
+
+static void g9001_mmc_open(G9001Mmc *m, const G9001MachineState *gms)
+{
+    /* Synthetic MMC identity. The optional CID/CSD properties take precedence. */
     static const uint8_t cid[16] = {
         0x01, 0x53, 0x49, 0x49, 0x47, 0x39, 0x30, 0x30,
         0x31, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
     };
-    /* CSD v1.0: 128 MiB, 512-byte blocks, 8-bit, 25 MHz */
     static const uint8_t csd[16] = {
         0x00, 0x2d, 0x00, 0x32, 0x13, 0x59, 0x83, 0xb9,
         0xed, 0xcf, 0xff, 0x92, 0x40, 0x40, 0x00, 0x2b,
     };
+    const char *path = gms->spi_image_path;
+    struct stat st;
+    uint64_t sectors;
 
+    m->fd = open(path, O_RDONLY | O_BINARY);
+    if (m->fd < 0 || fstat(m->fd, &st) < 0) {
+        error_report("g9001: cannot open MMC image '%s': %s", path,
+                     strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+    if (st.st_size <= 0 || st.st_size % G9001_SPI_SECTOR_SIZE ||
+        st.st_size > UINT32_MAX + 1ULL) {
+        error_report("g9001: MMC image must contain whole 512-byte sectors "
+                     "in a 32-bit byte address space");
+        exit(EXIT_FAILURE);
+    }
+    m->sectors = st.st_size / G9001_SPI_SECTOR_SIZE;
+    m->idle = true;
     memcpy(m->cid, cid, sizeof(cid));
     memcpy(m->csd, csd, sizeof(csd));
+    if (g_strcmp0(gms->spi_card_type, "dict") == 0) {
+        /* Serial decoded by the G9001 from sector 0 of the EDICT dump. */
+        stl_be_p(m->cid + 10, 0x41003641);
+    }
+    m->cid[15] = g9001_mmc_identity_crc(m->cid);
+    sectors = gms->mmc_capacity_mb ?
+        (uint64_t)gms->mmc_capacity_mb * MiB / G9001_SPI_SECTOR_SIZE :
+        m->sectors;
+
+    if ((gms->mmc_cid_hex &&
+         !g9001_mmc_parse_identity(m->cid, gms->mmc_cid_hex)) ||
+        (gms->mmc_csd_hex &&
+         !g9001_mmc_parse_identity(m->csd, gms->mmc_csd_hex))) {
+        error_report("g9001: MMC CID/CSD must each be 32 hex digits");
+        exit(EXIT_FAILURE);
+    }
+    if (!gms->mmc_csd_hex) {
+        if (sectors < m->sectors || sectors > UINT32_MAX) {
+            error_report("g9001: invalid MMC capacity for image '%s'", path);
+            exit(EXIT_FAILURE);
+        }
+        g9001_mmc_set_csd(m, sectors);
+    }
+    info_report("g9001: SPI MMC image '%s' (%u sectors, read-only)",
+                path, m->sectors);
 }
 
-static void g9001_mmc_update_csd(G9001Mmc *m)
+static void g9001_mmc_queue_data(G9001Mmc *m, const uint8_t *data, size_t len)
 {
-    /*
-     * Rewrite the capacity fields for the configured size:
-     * MMC CSD v1.0: C_SIZE[73:62] = (capacity_bytes / 512 / 1024) - 1
-     * with READ_BL_LEN = 9 (512 bytes).
-     */
-    uint32_t blocks = m->capacity_mb * 1024u * 1024u / 512u;
-    uint32_t c_size = blocks / 1024u - 1u;
+    uint16_t crc = crc_ccitt_false(0, data, len);
 
-    m->csd[4] = (m->csd[4] & 0x03) | ((c_size >> 10) & 0xfc);
-    m->csd[5] = (c_size >> 2) & 0xff;
-    m->csd[6] = (m->csd[6] & 0x03) | ((c_size & 0x03) << 6);
-    m->csd[5] = (m->csd[5] & 0xf0) | 0x03;
+    m->resp[m->resp_len++] = 0xff;       /* data access delay */
+    m->resp[m->resp_len++] = 0xfe;
+    memcpy(m->resp + m->resp_len, data, len);
+    m->resp_len += len;
+    stw_be_p(m->resp + m->resp_len, crc);
+    m->resp_len += 2;
 }
 
-static void g9001_mmc_open(G9001State *s, const char *path)
+static bool g9001_mmc_queue_sector(G9001Mmc *m, uint32_t lba)
+{
+    uint8_t sector[G9001_SPI_SECTOR_SIZE];
+
+    if (lba >= m->sectors ||
+        pread(m->fd, sector, sizeof(sector), (off_t)lba * sizeof(sector)) !=
+        sizeof(sector)) {
+        return false;
+    }
+    g9001_mmc_queue_data(m, sector, sizeof(sector));
+    return true;
+}
+
+static void g9001_mmc_command(G9001State *s)
 {
     G9001Mmc *m = &s->mmc;
-    struct stat st;
+    unsigned op = m->cmd[0] & 0x3f;
+    uint32_t arg = ldl_be_p(m->cmd + 1);
+    uint32_t lba = arg / G9001_SPI_SECTOR_SIZE;
+    uint8_t status = m->idle ? 1 : 0;
 
-    m->fd = -1;
-    m->size = 0;
-    if (path == NULL || path[0] == 0) {
-        return;
+    m->resp_pos = 0;
+    m->resp_len = 2;
+    m->resp[0] = 0xff;                   /* Ncr before R1 */
+    switch (op) {
+    case 0:                             /* GO_IDLE_STATE */
+        m->idle = true;
+        m->multi_read = false;
+        m->block_count = 0;
+        status = 1;
+        break;
+    case 1:                             /* SEND_OP_COND (MMC) */
+        m->idle = false;
+        status = 0;
+        break;
+    case 9:                             /* SEND_CSD */
+    case 10:                            /* SEND_CID */
+        if (!m->idle) {
+            g9001_mmc_queue_data(m, op == 9 ? m->csd : m->cid, 16);
+        }
+        break;
+    case 12:                            /* STOP_TRANSMISSION */
+        m->multi_read = false;
+        break;
+    case 13:                            /* SEND_STATUS: R2 */
+        m->resp[m->resp_len++] = 0;
+        break;
+    case 16:                            /* SET_BLOCKLEN */
+        if (arg != G9001_SPI_SECTOR_SIZE) {
+            status |= 0x40;
+        }
+        break;
+    case 17:                            /* READ_SINGLE_BLOCK */
+    case 18:                            /* READ_MULTIPLE_BLOCK */
+        if (!m->idle) {
+            if (arg % G9001_SPI_SECTOR_SIZE ||
+                !g9001_mmc_queue_sector(m, lba)) {
+                status |= 0x20;
+            } else {
+                if (op == 18) {
+                    m->blocks_left = m->block_count ? m->block_count - 1 :
+                                                     UINT32_MAX;
+                    m->next_lba = lba + 1;
+                    m->multi_read = m->blocks_left != 0;
+                    m->block_count = 0;
+                }
+            }
+        }
+        break;
+    case 23:                            /* SET_BLOCK_COUNT (MMC) */
+        if (!m->idle) {
+            m->block_count = arg;
+        }
+        break;
+    case 58:                            /* READ_OCR */
+        stl_be_p(m->resp + m->resp_len, m->idle ? 0x00ff8000 : 0x80ff8000);
+        m->resp_len += 4;
+        break;
+    case 59:                            /* CRC_ON_OFF, data CRC always sent */
+        break;
+    default:                            /* including SD-only probe CMD8 */
+        status |= 0x04;
+        break;
     }
-    m->fd = open(path, O_RDONLY | O_BINARY);
-    if (m->fd < 0) {
-        error_report("g9001: cannot open SPI card image '%s': %s", path,
-                     strerror(errno));
-        return;
-    }
-    if (fstat(m->fd, &st) == 0) {
-        m->size = st.st_size;
-    }
-    info_report("g9001: SPI card image '%s' %" PRIu64 " bytes", path, m->size);
-}
+    m->resp[1] = status;
 
-static uint32_t g9001_mmc_bits_per_transfer(const G9001Spi *spi)
-{
-    unsigned bpt = (spi->ctl1 >> G9001_SPI_CTL1_BPT_SHIFT) &
-                   G9001_SPI_CTL1_BPT_MASK;
-    return bpt + 1;
+    if (G9001_MACHINE(s->machine)->trace_spi) {
+        info_report("g9001-mmc: CMD%u arg=0x%08x R1=0x%02x", op, arg, status);
+    }
 }
 
 static uint8_t g9001_mmc_byte(G9001State *s, uint8_t out)
 {
     G9001Mmc *m = &s->mmc;
 
-    m->xfers++;
-
-    /* response bytes waiting? */
     if (m->resp_pos < m->resp_len) {
         return m->resp[m->resp_pos++];
     }
 
-    /* streaming data block out? */
-    if (m->data_out) {
-        if (!m->data_token_sent) {
-            m->data_token_sent = true;
-            return G9001_MMC_START_TOKEN;
+    if (m->cmd_len || (out & 0xc0) == 0x40) {
+        m->cmd[m->cmd_len++] = out;
+        if (m->cmd_len == sizeof(m->cmd)) {
+            m->cmd_len = 0;
+            g9001_mmc_command(s);
         }
-        if (m->data_left > 0) {
-            uint8_t v = 0xff;
-
-            if (m->fd >= 0) {
-                off_t off = (off_t)(m->data_lba * 512 + (512 - m->data_left));
-                if ((uint64_t)off < m->size && read(m->fd, &v, 1) < 0) {
-                    v = 0xff;
-                } else if ((uint64_t)off < m->size) {
-                    lseek(m->fd, off, SEEK_SET);
-                    if (read(m->fd, &v, 1) != 1) {
-                        v = 0xff;
-                    }
-                }
-            }
-            m->data_left--;
-            return v;
+    } else if (m->multi_read && out == 0xff) {
+        m->resp_pos = m->resp_len = 0;
+        if (g9001_mmc_queue_sector(m, m->next_lba++)) {
+            m->multi_read = --m->blocks_left != 0;
+            return m->resp[m->resp_pos++];
         }
-        if (!m->data_crc_sent) {
-            m->data_crc_sent = true;
-            return 0xff;            /* CRC byte 1 */
-        }
-        if (m->data_crc_sent && m->data_left == 0) {
-            m->data_out = false;    /* CRC byte 2 ends the stream */
-            return 0xff;
-        }
+        m->multi_read = false;
+        return 0x08;                     /* data out of range */
     }
+    return 0xff;
+}
 
-    /* collect a command */
-    if (m->cmd_active) {
-        if (m->cmd_len < 6) {
-            m->cmd[m->cmd_len++] = out;
-        }
-        if (m->cmd_len == 6) {
-            uint8_t op = m->cmd[0] & 0x3f;
-            uint32_t arg = ((uint32_t)m->cmd[1] << 24) |
-                           ((uint32_t)m->cmd[2] << 16) |
-                           ((uint32_t)m->cmd[3] << 8) | m->cmd[4];
-
-            m->cmd_active = false;
-            m->resp_pos = 0;
-            m->resp_len = 0;
-            switch (op) {
-            case 0:             /* GO_IDLE_STATE */
-                m->resp[0] = 0x01;
-                m->resp_len = 1;
-                break;
-            case 1:             /* SEND_OP_COND */
-                m->resp[0] = 0x00;
-                m->resp_len = 1;
-                break;
-            case 8:             /* SEND_IF_COND: R7 = R1 + echo */
-                m->resp[0] = 0x01;
-                m->resp[1] = (arg >> 24) & 0xff;
-                m->resp[2] = (arg >> 16) & 0xff;
-                m->resp[3] = (arg >> 8) & 0xff;
-                m->resp[4] = arg & 0xff;
-                m->resp_len = 5;
-                break;
-            case 9:             /* SEND_CSD */
-                m->resp[0] = 0x00;
-                memcpy(m->resp + 1, m->csd, 16);
-                m->resp_len = 17;
-                break;
-            case 10:            /* SEND_CID */
-                m->resp[0] = 0x00;
-                memcpy(m->resp + 1, m->cid, 16);
-                m->resp_len = 17;
-                break;
-            case 12:            /* STOP_TRANSMISSION */
-            case 16:            /* SET_BLOCKLEN */
-            case 55:            /* APP_CMD */
-            case 59:
-                m->resp[0] = 0x00;
-                m->resp_len = 1;
-                break;
-            case 13:            /* SEND_STATUS */
-                m->resp[0] = 0x00;
-                m->resp[1] = 0x00;
-                m->resp_len = 2;
-                break;
-            case 17:            /* READ_SINGLE_BLOCK */
-                m->resp[0] = 0x00;
-                m->resp_len = 1;
-                m->data_out = true;
-                m->data_lba = m->high_capacity ? arg : arg / 512;
-                m->data_left = 512;
-                m->data_token_sent = false;
-                m->data_crc_sent = false;
-                break;
-            case 18:            /* READ_MULTIPLE_BLOCK */
-                m->resp[0] = 0x00;
-                m->resp_len = 1;
-                m->data_out = true;
-                m->data_lba = m->high_capacity ? arg : arg / 512;
-                m->data_left = 512;
-                m->data_token_sent = false;
-                m->data_crc_sent = false;
-                break;
-            case 58:            /* READ_OCR */
-                m->resp[0] = 0x00;
-                m->resp[1] = 0x80;      /* power up done (bit 31) */
-                m->resp[2] = 0xff;
-                m->resp[3] = 0x80;
-                m->resp[4] = 0x00;
-                m->resp_len = 5;
-                break;
-            default:
-                m->resp[0] = 0x00;
-                m->resp_len = 1;
-                break;
-            }
-        }
-        return G9001_MMC_IDLE_TOKEN;
+static void g9001_spi_set_cs(G9001State *s, bool selected)
+{
+    if (s->spi.selected == selected) {
+        return;
     }
-
-    /* idle: 0xFF means "no response yet"; 0x40 starts a command */
-    if ((out & 0xc0) == 0x40) {
-        m->cmd[0] = out;
-        m->cmd_len = 1;
-        m->cmd_active = true;
-        return G9001_MMC_IDLE_TOKEN;
+    s->spi.selected = selected;
+    if (s->spi.sd_bus) {
+        qemu_set_irq(s->spi.sd_cs, !selected);
     }
-    return G9001_MMC_IDLE_TOKEN;
+    if (!selected) {
+        s->mmc.cmd_len = 0;
+        s->mmc.resp_pos = s->mmc.resp_len = 0;
+        s->mmc.multi_read = false;
+    }
 }
 
 static void g9001_spi_txd_write(G9001State *s, uint32_t value)
 {
     G9001Spi *spi = &s->spi;
-    uint32_t bits = g9001_mmc_bits_per_transfer(spi);
-    uint32_t bytes = (bits + 7) / 8;
+    unsigned bits = extract32(spi->ctl1, G9001_SPI_CTL1_BPT_SHIFT, 5) + 1;
     uint32_t rx = 0;
     unsigned i;
 
-    if (bytes == 0) {
-        bytes = 1;
+    if (!(spi->ctl1 & G9001_SPI_CTL1_ENA)) {
+        return;
     }
-    if (bytes > 4) {
-        bytes = 4;
-    }
-    for (i = 0; i < bytes; i++) {
-        uint32_t shift = 8 * (bytes - 1 - i);
-        uint8_t out = (value >> shift) & 0xff;
-        uint8_t in = g9001_mmc_byte(s, out);
+    for (i = DIV_ROUND_UP(bits, 8); i > 0; i--) {
+        unsigned shift = 8 * (i - 1);
+        uint8_t out = value >> shift;
+        uint8_t in = 0xff;
 
+        if (spi->selected) {
+            if (spi->sd_bus) {
+                in = ssi_transfer(spi->sd_bus, out);
+            } else if (s->mmc.fd >= 0) {
+                in = g9001_mmc_byte(s, out);
+            }
+        }
         rx |= (uint32_t)in << shift;
     }
     spi->rxd = rx;
@@ -2117,83 +2428,90 @@ static void g9001_spi_txd_write(G9001State *s, uint32_t value)
 
 static uint32_t g9001_spi_stat(const G9001State *s)
 {
-    uint32_t v = G9001_SPI_STAT_TDEF;   /* transmitter never stalls */
-
-    if (s->spi.rxd_valid) {
-        v |= G9001_SPI_STAT_RDFF;
-    }
-    return v;
+    return G9001_SPI_STAT_TDEF |
+           (s->spi.rxd_valid ? G9001_SPI_STAT_RDFF : 0);
 }
 
-/*
- * Scripted exchange through the same byte path the firmware uses, so the
- * model can be validated without a guest driver:
- *   CMD0  -> R1 = 0x01
- *   CMD8  -> R7 = 0x01 00 00 01 aa
- *   CMD10 -> R1 + 16 CID bytes
- *   CMD17 -> R1 + 0xFE + 512 data bytes
- */
-static void g9001_spi_selftest(G9001State *s)
+static uint8_t g9001_spi_test_byte(G9001State *s, uint8_t value)
 {
-    static const uint8_t cmd0[6] = { 0x40, 0x00, 0x00, 0x00, 0x00, 0x95 };
-    static const uint8_t cmd8[6] = { 0x48, 0x00, 0x00, 0x01, 0xaa, 0x87 };
-    static const uint8_t cmd10[6] = { 0x4a, 0x00, 0x00, 0x00, 0x00, 0x01 };
-    static const uint8_t cmd17[6] = { 0x51, 0x00, 0x00, 0x00, 0x00, 0x01 };
-    uint8_t r[24];
+    g9001_spi_txd_write(s, value);
+    return s->spi.rxd;
+}
+
+static uint8_t g9001_spi_test_command(G9001State *s, unsigned cmd, uint32_t arg)
+{
+    uint8_t request[6] = { 0x40 | cmd, 0, 0, 0, 0, cmd == 0 ? 0x95 : 1 };
+    uint8_t response = 0xff;
     unsigned i;
 
-    for (i = 0; i < 6; i++) {
-        g9001_mmc_byte(s, cmd0[i]);
+    stl_be_p(request + 1, arg);
+    for (i = 0; i < sizeof(request); i++) {
+        g9001_spi_test_byte(s, request[i]);
     }
-    r[0] = g9001_mmc_byte(s, 0xff);
-    info_report("g9001-spi: CMD0  -> R1=0x%02x", r[0]);
+    for (i = 0; i < 8 && response == 0xff; i++) {
+        response = g9001_spi_test_byte(s, 0xff);
+    }
+    return response;
+}
 
-    for (i = 0; i < 6; i++) {
-        g9001_mmc_byte(s, cmd8[i]);
-    }
-    for (i = 0; i < 5; i++) {
-        r[i] = g9001_mmc_byte(s, 0xff);
-    }
-    info_report("g9001-spi: CMD8  -> R7=%02x %02x %02x %02x %02x",
-                r[0], r[1], r[2], r[3], r[4]);
+static uint8_t g9001_spi_test_data(G9001State *s, uint8_t *data, size_t len)
+{
+    uint8_t token = g9001_spi_test_byte(s, 0xff);
+    unsigned i;
 
-    for (i = 0; i < 6; i++) {
-        g9001_mmc_byte(s, cmd10[i]);
+    if (token == 0xff) {
+        token = g9001_spi_test_byte(s, 0xff);
     }
-    for (i = 0; i < 17; i++) {
-        r[i] = g9001_mmc_byte(s, 0xff);
+    if (token == 0xfe) {
+        for (i = 0; i < len; i++) {
+            data[i] = g9001_spi_test_byte(s, 0xff);
+        }
+        g9001_spi_test_byte(s, 0xff);
+        g9001_spi_test_byte(s, 0xff);
     }
-    info_report("g9001-spi: CMD10 -> R1=0x%02x CID=%02x%02x%02x%02x"
-                "%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x", r[0],
-                r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10],
-                r[11], r[12], r[13], r[14], r[15], r[16]);
+    return token;
+}
 
-    for (i = 0; i < 6; i++) {
-        g9001_mmc_byte(s, cmd17[i]);
+static void g9001_spi_selftest(G9001State *s)
+{
+    uint8_t cid[16] = { 0 };
+    uint8_t sector[G9001_SPI_SECTOR_SIZE] = { 0 };
+    uint8_t r1, token;
+
+    if (s->mmc.fd < 0) {
+        warn_report("g9001: debug-spi-test requires an MMC image");
+        return;
     }
-    for (i = 0; i < 10; i++) {
-        r[i] = g9001_mmc_byte(s, 0xff);
-    }
-    info_report("g9001-spi: CMD17 -> R1=0x%02x token=0x%02x data=%02x %02x "
-                "%02x %02x %02x %02x %02x %02x", r[0], r[1], r[2], r[3],
-                r[4], r[5], r[6], r[7], r[8], r[9]);
-    for (i = 0; i < 512 - 8; i++) {
-        (void)g9001_mmc_byte(s, 0xff);
-    }
-    (void)g9001_mmc_byte(s, 0xff);
-    (void)g9001_mmc_byte(s, 0xff);
+    s->spi.ctl1 = (7u << G9001_SPI_CTL1_BPT_SHIFT) | G9001_SPI_CTL1_ENA;
+    g9001_spi_set_cs(s, true);
+    r1 = g9001_spi_test_command(s, 0, 0);
+    info_report("g9001-spi: CMD0  -> R1=0x%02x", r1);
+    r1 = g9001_spi_test_command(s, 8, 0x1aa);
+    info_report("g9001-spi: CMD8  -> R1=0x%02x", r1);
+    r1 = g9001_spi_test_command(s, 1, 0);
+    info_report("g9001-spi: CMD1  -> R1=0x%02x", r1);
+    r1 = g9001_spi_test_command(s, 10, 0);
+    token = g9001_spi_test_data(s, cid, sizeof(cid));
+    info_report("g9001-spi: CMD10 -> R1=0x%02x token=0x%02x CID=%02x%02x%02x%02x",
+                r1, token, cid[0], cid[1], cid[2], cid[3]);
+    r1 = g9001_spi_test_command(s, 17, 0);
+    token = g9001_spi_test_data(s, sector, sizeof(sector));
+    info_report("g9001-spi: CMD17 -> R1=0x%02x token=0x%02x MBR=%02x%02x",
+                r1, token, sector[510], sector[511]);
+    g9001_spi_test_command(s, 0, 0);
+    g9001_spi_set_cs(s, false);
+    s->spi.ctl1 = 0;
+    s->spi.rxd_valid = false;
 }
 
 /* ------------------------------------------------------------------------- */
-/* interrupt controller + 16-bit timer 0                                     */
+/* interrupt controller + 16-bit timers                                      */
 /* ------------------------------------------------------------------------- */
 
 /*
  * Only the sources the firmware actually uses are wired up so far.  Flag and
  * enable registers share the bit layout; the ILC priority register holds two
- * 4-bit levels per byte.  Vector numbers follow the S1C33 family layout that
- * the BBK 9288 machine already uses (16TM0 compare B = 30, compare A = 31)
- * and still have to be confirmed against manual table III.2.1.1.1.
+ * 4-bit levels per byte. See E08 manual table III.2.1.1.1 for the vectors.
  */
 typedef struct G9001IrqSource {
     uint16_t flag_off;
@@ -2206,9 +2524,39 @@ typedef struct G9001IrqSource {
 } G9001IrqSource;
 
 static const G9001IrqSource g9001_irq_sources[] = {
-    { 0x0282, 0x0272, 0x0266, 0, 0x04, 30, "16TM0B" },
-    { 0x0282, 0x0272, 0x0266, 0, 0x08, 31, "16TM0A" },
+    { G9001_IO_INT_FK01_FP03, G9001_IO_INT_EK01_EP03,
+      G9001_IO_INT_PK01L, 0, BIT(4), 20, "FPK0" },
+    { G9001_IO_INT_FK01_FP03, G9001_IO_INT_EK01_EP03,
+      G9001_IO_INT_PK01L, 4, BIT(5), 21, "FPK1" },
+    { G9001_IO_INT_F16T01, G9001_IO_INT_E16T01, 0x0266, 0, 0x04, 30, "16TM0B" },
+    { G9001_IO_INT_F16T01, G9001_IO_INT_E16T01, 0x0266, 0, 0x08, 31, "16TM0A" },
+    { G9001_IO_INT_F16T45, G9001_IO_INT_E16T45, 0x0268, 0, 0x04, 46, "16TM4B" },
+    { G9001_IO_INT_F16T45, G9001_IO_INT_E16T45, 0x0268, 0, 0x08, 47, "16TM4A" },
+    { G9001_IO_INT_F16T45, G9001_IO_INT_E16T45, 0x0268, 4, 0x40, 50, "16TM5B" },
+    { G9001_IO_INT_F16T45, G9001_IO_INT_E16T45, 0x0268, 4, 0x80, 51, "16TM5A" },
 };
+
+static const struct {
+    uint16_t base;
+    uint16_t flag;
+    uint8_t shift;
+} g9001_t16_regs[] = {
+    { G9001_IO_T16_0CA, G9001_IO_INT_F16T01, 0 },
+    { G9001_IO_T16_4CA, G9001_IO_INT_F16T45, 0 },
+    [G9001_T16_5_INDEX] = { G9001_IO_T16_5CA, G9001_IO_INT_F16T45, 4 },
+};
+
+static int g9001_t16_index(hwaddr off)
+{
+    for (unsigned i = 0; i < ARRAY_SIZE(g9001_t16_regs); i++) {
+        uint16_t base = g9001_t16_regs[i].base;
+
+        if (off >= base && off < base + G9001_T16_REGS) {
+            return i;
+        }
+    }
+    return -1;
+}
 
 static void g9001_update_irq(G9001State *s)
 {
@@ -2242,7 +2590,8 @@ static void g9001_update_irq(G9001State *s)
         s->irq_active = false;
         return;
     }
-    if (s->trace_irq) {
+    if (s->trace_irq && (!s->irq_active || s->irq_vector != best_vector ||
+                         s->irq_prio != best_level)) {
         info_report("g9001-irq: vector=%u level=%u pc=0x%08x", best_vector,
                     best_level, g9001_current_pc());
     }
@@ -2252,43 +2601,91 @@ static void g9001_update_irq(G9001State *s)
     s1c33_cpu_set_irq(CPU(s->cpu), true, best_vector, best_level);
 }
 
-/* Advance the timer counter by the time elapsed since the last update. */
-static void g9001_t16_advance(G9001State *s)
+static uint32_t g9001_t16_input_hz(G9001State *s, unsigned index)
 {
-    G9001T16 *t = &s->t16;
+    /* E08 manual IV.1.8.3: timer input is the divided MCLK. */
+    static const uint16_t timer_div[] = { 1, 2, 4, 16, 64, 256, 1024, 4096 };
+    static const uint8_t osc3_div[] = { 1, 2, 4, 8, 16, 32, 1, 1 };
+    uint8_t clock = s->io[G9001_IO_T16_5CLKCTL];
+    uint8_t clock_div = s->io[G9001_IO_CMU_CLKCNTL + 1];
+    unsigned source = extract32(s->io[G9001_IO_CMU_CLKCNTL], 2, 2);
+    uint32_t mclk_hz = 48000000;
+
+    if (index != G9001_T16_5_INDEX) {
+        return s->t16_hz ?: 32768;
+    }
+    if (!(clock & BIT(3))) {
+        return 0;
+    }
+    if (s->t16_hz) {
+        return s->t16_hz;
+    }
+    /* The firmware's debounce setup uses 48 MHz for the active PLL clock. */
+    if (source == 1) {
+        mclk_hz = 32768;
+    } else if (source != 3) {
+        mclk_hz /= osc3_div[clock_div & 7];
+    }
+    mclk_hz >>= extract32(clock_div, 4, 1);
+    return mclk_hz / timer_div[clock & 7];
+}
+
+/* Advance the timer counter by the time elapsed since the last update. */
+static void g9001_t16_advance(G9001State *s, unsigned index)
+{
+    G9001T16 *t = &s->t16[index];
+    uint8_t *flags = &s->io[g9001_t16_regs[index].flag];
     uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    uint64_t counts;
-    uint16_t period;
+    uint64_t rate_ns, counts;
 
-    if (!t->running) {
+    if (!t->running || (t->ctl & BIT(3)) || now <= t->last_ns) {
         t->last_ns = now;
         return;
     }
-    if (t->last_ns == 0 || now <= t->last_ns) {
-        t->last_ns = now;
-        return;
-    }
-    counts = (now - t->last_ns) * (uint64_t)s->t16_hz / 1000000000ull +
-             t->frac;
+    rate_ns = (now - t->last_ns) * g9001_t16_input_hz(s, index) + t->frac;
+    counts = rate_ns / NANOSECONDS_PER_SECOND;
+    t->frac = rate_ns % NANOSECONDS_PER_SECOND;
     t->last_ns = now;
-    if (counts == 0) {
-        return;
-    }
-    t->frac = counts % (uint64_t)s->t16_hz / 2;
-    counts = MIN(counts, 4 * 65536ull);
 
-    period = t->cb != 0 ? t->cb : (t->ca != 0 ? t->ca : 0x10000);
     while (counts-- > 0) {
         t->counter++;
         if (t->counter == t->ca) {
-            s->io[0x0282] |= 0x08;          /* compare A */
+            *flags |= BIT(3 + g9001_t16_regs[index].shift);
         }
         if (t->counter == t->cb) {
-            s->io[0x0282] |= 0x04;          /* compare B */
-        }
-        if (t->counter >= period) {
+            *flags |= BIT(2 + g9001_t16_regs[index].shift);
             t->counter = 0;
         }
+    }
+}
+
+static void g9001_t16_write(G9001State *s, unsigned index, hwaddr off, uint8_t v)
+{
+    G9001T16 *t = &s->t16[index];
+    uint16_t base = g9001_t16_regs[index].base;
+
+    g9001_t16_advance(s, index);
+    s->io[off] = v;
+    switch ((off - base) & ~1u) {
+    case 0:
+        t->ca = lduw_le_p(&s->io[base]);
+        break;
+    case G9001_T16_CB:
+        t->cb = lduw_le_p(&s->io[base + G9001_T16_CB]);
+        break;
+    case G9001_T16_TC:
+        t->counter = deposit32(t->counter, (off & 1) * 8, 8, v);
+        break;
+    case G9001_T16_CTL:
+        t->ctl = s->io[base + G9001_T16_CTL];
+        if (t->ctl & BIT(1)) {
+            t->counter = 0;
+            t->frac = 0;
+        }
+        t->ctl &= ~BIT(1);
+        s->io[base + G9001_T16_CTL] = t->ctl;
+        t->running = t->ctl & BIT(0);
+        break;
     }
     g9001_update_irq(s);
 }
@@ -2298,7 +2695,10 @@ static void g9001_t16_cb(void *opaque)
     G9001State *s = opaque;
     G9001MachineState *gms = G9001_MACHINE(s->machine);
 
-    g9001_t16_advance(s);
+    for (unsigned i = 0; i < ARRAY_SIZE(s->t16); i++) {
+        g9001_t16_advance(s, i);
+    }
+    g9001_update_irq(s);
     /*
      * Diagnostic: keep the loader's idle event flag raised so its
      * `while (!event) halt;` loop never blocks, and we can see what the rest
@@ -2320,7 +2720,7 @@ static void g9001_t16_cb(void *opaque)
  * we perform the block move synchronously.  Source or destination may be the
  * card window, in which case reading it pops one byte from the NAND stream.
  */
-static void g9001_hsdma_run(G9001State *s)
+static void g9001_hsdma_run_ch2(G9001State *s)
 {
     uint32_t count = lduw_le_p(&s->io[G9001_IO_HS2_CNT]);
     uint32_t src = ldl_le_p(&s->io[G9001_IO_HS2_SADR]);
@@ -2328,9 +2728,11 @@ static void g9001_hsdma_run(G9001State *s)
     uint8_t *buf;
     uint32_t i;
 
-    if (count == 0 || count > 64 * 1024) {
+    if (count == 0) {
         return;
     }
+    s->io[G9001_IO_HS2_EN] &= ~BIT(0);
+    s->io[G9001_IO_HS2_TF] &= ~BIT(0);
     buf = g_malloc(count);
     s->hsdma_last_ptr = s->nand.data_ptr;
     if (src >= G9001_CARD11_BASE &&
@@ -2356,12 +2758,8 @@ static void g9001_hsdma_run(G9001State *s)
     }
     address_space_write(&address_space_memory, (hwaddr)dst,
                         MEMTXATTRS_UNSPECIFIED, buf, count);
-    /*
-     * Completion clears the start/busy bit (6) and sets done (7): the firmware
-     * starts every transfer by writing bit 6 again, so a level trigger is
-     * correct only if the hardware clears it here.
-     */
-    s->io[G9001_IO_HS2_STAT] = 0x81;
+    stw_le_p(&s->io[G9001_IO_HS2_CNT], 0);
+    s->io[G9001_IO_INT_FDMA] |= G9001_HS2_BIT;
     s->hsdma_copies++;
     if (s->trace_io) {
         info_report("g9001-hsdma: copy %u bytes 0x%08x -> 0x%08x (row=%u col=%u ptr %u->%u phase=%d) head=%02x %02x %02x %02x %02x %02x %02x %02x",
@@ -2376,14 +2774,309 @@ static void g9001_hsdma_run(G9001State *s)
     g_free(buf);
 }
 
+/* E08 advanced-mode dual-address successive transfers, used by the loader. */
+static void g9001_hsdma_run_ch3(G9001State *s)
+{
+    uint16_t control = lduw_le_p(&s->io[G9001_IO_HS3_CTL]);
+    uint8_t src_control = s->io[G9001_IO_HS3_SCTL];
+    uint8_t dst_control = s->io[G9001_IO_HS3_DCTL];
+    uint8_t advanced = s->io[G9001_IO_HS3_ADV];
+    uint32_t src = ldl_le_p(&s->io[G9001_IO_HS3_SADR]);
+    uint32_t dst = ldl_le_p(&s->io[G9001_IO_HS3_DADR]);
+    uint32_t count = lduw_le_p(&s->io[G9001_IO_HS3_CNT]) |
+                     ((uint32_t)(control & 0xff) << 16);
+    unsigned unit_size = advanced & BIT(0) ? 4 : src_control & BIT(6) ? 2 : 1;
+    unsigned src_mode = extract32(src_control, 4, 2);
+    unsigned dst_mode = extract32(dst_control, 4, 2);
+    static const int address_step[] = { 0, -1, 1, 1 };
+    int src_step = advanced & BIT(4) ? -1 : address_step[src_mode];
+    int dst_step = advanced & BIT(5) ? -1 : address_step[dst_mode];
+    uint8_t data[4] = { 0 };
+
+    if (!(s->io[G9001_IO_HS_MODE] & BIT(0)) || !(control & BIT(15)) ||
+        (dst_control >> 6) != 1) {
+        qemu_log_mask(LOG_UNIMP, "g9001-hsdma: unsupported channel 3 mode\n");
+        return;
+    }
+
+    if (count == 0) {
+        count = 1u << 24;
+    }
+    s->io[G9001_IO_HS3_EN] &= ~BIT(0);
+    s->io[G9001_IO_HS3_TF] &= ~BIT(0);
+    if (s->trace_io) {
+        info_report("g9001-hsdma: ch3 copy %u x %u bytes 0x%08x -> 0x%08x",
+                    count, unit_size, src, dst);
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        address_space_read(&address_space_memory, src, MEMTXATTRS_UNSPECIFIED,
+                           data, unit_size);
+        address_space_write(&address_space_memory, dst, MEMTXATTRS_UNSPECIFIED,
+                            data, unit_size);
+        src += src_step * (int)unit_size;
+        dst += dst_step * (int)unit_size;
+    }
+
+    if (src_mode != 2 && !(advanced & BIT(4))) {
+        stl_le_p(&s->io[G9001_IO_HS3_SADR], src);
+    }
+    if (dst_mode != 2 && !(advanced & BIT(5))) {
+        stl_le_p(&s->io[G9001_IO_HS3_DADR], dst);
+    }
+    stw_le_p(&s->io[G9001_IO_HS3_CNT], 0);
+    stw_le_p(&s->io[G9001_IO_HS3_CTL], control & 0xff00);
+    s->io[G9001_IO_INT_FDMA] |= G9001_HS3_BIT;
+    s->hsdma_copies++;
+}
+
+/*
+ * Area 1 normally contains the Epson MP3 BIOS. Supply its seven documented
+ * entry points. HWMP3.DLL's callback bridge uses r6/r7 for arguments and
+ * r4 for the result. The stubs hand the encoded bytes to the host player.
+ */
+static void g9001_mp3_install(G9001State *s)
+{
+    uint8_t *area = memory_region_get_ram_ptr(&s->area1);
+    uint8_t *vector = area + G9001_MP3_VECTOR - G9001_AREA1_BASE;
+    uint8_t *rom = area + G9001_MP3_ROM - G9001_AREA1_BASE;
+    static const uint16_t play[] = {
+        /* Preserve r0-r8 and begin a clip. */
+        0x0208, 0xc006, 0xc0fc, 0x6c4b, 0x3cbc,
+        /* Read the transfer function, destination (r6) and length (r7). */
+        0xc006, 0xc0fc, 0x6c8b, 0x30ba, 0x680a, 0x1810, 0x2eab,
+        0xc006, 0xc0fc, 0x6cc6, 0x3066,
+        0xc006, 0xc0fc, 0x6d07, 0x3077,
+        /* Call TransferData, submit the returned byte count (r4), repeat. */
+        0x060b, 0xc006, 0xc0fc, 0x6d4b, 0x3cb4, 0x1eec,
+        /* Notify Event(MP3DEC_FILE_END) when the clip is complete. */
+        0xc006, 0xc0fc, 0x6d8b, 0x30bb, 0x680b, 0x1803, 0x6ca6, 0x060b,
+        /* Return the BIOS result in r10. */
+        0xc006, 0xc0fc, 0x6c0b, 0x30ba, 0x0248, 0x0640,
+    };
+    unsigned i;
+
+    for (i = 0; i < 7; i++) {
+        uint32_t entry = i * 12;
+        uint8_t *stub = rom + entry;
+
+        if (i == 2 || i == 6) { /* Start and Resync share the transfer loop. */
+            entry = 7 * 12;
+        } else {
+            /*
+             * xld.w r11, 0x303f40 + i*4; store argument; load r10; ret.
+             * HWMP3.DLL's BIOS bridge passes the Open parameter in r6.
+             */
+            stw_le_p(stub + 0, 0xc006);
+            stw_le_p(stub + 2, 0xc0fd);
+            stw_le_p(stub + 4, 0x6c0b + (i << 6));
+            stw_le_p(stub + 6, i == 0 ? 0x3cb6 : 0x3cbc);
+            stw_le_p(stub + 8, 0x30ba);
+            stw_le_p(stub + 10, 0x0640);
+        }
+        stl_le_p(vector + i * 4, G9001_MP3_ROM + entry);
+    }
+    for (i = 0; i < ARRAY_SIZE(play); i++) {
+        stw_le_p(rom + 7 * 12 + i * 2, play[i]);
+    }
+    s->mp3.clip = g_byte_array_new();
+}
+
+static const uint8_t *g9001_mp3_sdram(G9001State *s, uint32_t addr, size_t len)
+{
+    if (addr < G9001_SDRAM_BASE ||
+        (uint64_t)addr - G9001_SDRAM_BASE + len > s->machine->ram_size) {
+        return NULL;
+    }
+    return s->sdram_ptr + (addr - G9001_SDRAM_BASE);
+}
+
+static void g9001_mp3_player_exited(GPid pid, int status, gpointer opaque)
+{
+    char *path = opaque;
+    g_autoptr(GError) error = NULL;
+
+    if (!g_spawn_check_exit_status(status, &error)) {
+        warn_report("g9001: audio player exited: %s", error->message);
+    }
+    g_unlink(path);
+    g_free(path);
+    g_spawn_close_pid(pid);
+}
+
+static void g9001_mp3_play(G9001State *s)
+{
+    G9001MachineState *gms = G9001_MACHINE(s->machine);
+    GByteArray *clip = s->mp3.clip;
+    g_autoptr(GError) error = NULL;
+    g_autofree char *path = NULL;
+    GPid pid;
+    int fd;
+    ssize_t written;
+    const char *argv[] = {
+        gms->audio_player, "-autoexit", "-nodisp", "-loglevel", "error",
+        "-f", "mp3", NULL, NULL,
+    };
+
+    if (gms->audio_output &&
+        !g_file_set_contents(gms->audio_output, (char *)clip->data, clip->len,
+                             &error)) {
+        warn_report("g9001: cannot save pronunciation: %s", error->message);
+        g_clear_error(&error);
+    }
+    if (!gms->audio_player) {
+        return;
+    }
+    fd = g_file_open_tmp("qemu-g9001-mp3-XXXXXX", &path, &error);
+    if (fd < 0) {
+        warn_report("g9001: cannot create audio file: %s", error->message);
+        return;
+    }
+    written = qemu_write_full(fd, clip->data, clip->len);
+    close(fd);
+    argv[7] = path;
+    if (written == clip->len &&
+        g_spawn_async(NULL, (char **)argv, NULL,
+                      G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD,
+                      NULL, NULL, &pid, &error)) {
+        g_child_watch_add(pid, g9001_mp3_player_exited, g_steal_pointer(&path));
+    } else {
+        warn_report("g9001: cannot play pronunciation: %s",
+                    error ? error->message : "cannot write audio file");
+        g_unlink(path);
+    }
+}
+
+static void g9001_mp3_open(G9001State *s, uint32_t addr)
+{
+    G9001Mp3 *mp3 = &s->mp3;
+    const uint8_t *params = g9001_mp3_sdram(s, addr, 32);
+
+    mp3->transfer = 0;
+    mp3->status = -11; /* MP3DEC_ERR_INVALID_PARAM */
+    if (!params) {
+        qemu_log_mask(LOG_GUEST_ERROR, "g9001 MP3: invalid params %#x\n", addr);
+        return;
+    }
+    mp3->buffer = ldl_le_p(params + 4);
+    mp3->size = ldl_le_p(params + 8);
+    mp3->event = ldl_le_p(params + 28);
+    if (mp3->size >= 4096 && mp3->size <= G9001_MP3_CLIP_LIMIT &&
+        g9001_mp3_sdram(s, mp3->buffer, mp3->size)) {
+        mp3->transfer = ldl_le_p(params + 24);
+        mp3->status = 0;
+    }
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "g9001 MP3: open %#x buffer=%#x size=%u transfer=%#x event=%#x result=%d\n",
+                  addr, mp3->buffer, mp3->size, mp3->transfer,
+                  mp3->event, mp3->status);
+}
+
+/* HWMP3.DLL pads its transfer buffers with this encoded silence frame. */
+static void g9001_mp3_trim_padding(GByteArray *clip)
+{
+    static const uint8_t padding_header[] = {
+        0xff, 0xf3, 0x98, 0x64, 0x00, 0x00, 0x00, 0x01,
+        0xa4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
+        0x48, 0x00, 0x00, 0x00, 0x00, 'L', 'A', 'M', 'E',
+        '3', '.', '9', '6', '.', '1',
+    };
+    unsigned i;
+
+    for (i = 0; i + sizeof(padding_header) <= clip->len; i++) {
+        if (memcmp(clip->data + i, padding_header, sizeof(padding_header)) == 0) {
+            g_byte_array_set_size(clip, i);
+            return;
+        }
+    }
+}
+
+static void g9001_mp3_submit(G9001State *s, uint32_t size)
+{
+    G9001Mp3 *mp3 = &s->mp3;
+
+    if (!mp3->collecting) {
+        return;
+    }
+    qemu_log_mask(LOG_GUEST_ERROR, "g9001 MP3: transfer=%u\n", size);
+    if (size > mp3->size || size > G9001_MP3_CLIP_LIMIT - mp3->clip->len) {
+        mp3->status = -11;
+        mp3->collecting = false;
+        return;
+    }
+    if (size) {
+        g_byte_array_append(mp3->clip, g9001_mp3_sdram(s, mp3->buffer, size),
+                            size);
+    }
+    if (size < mp3->size) {
+        mp3->collecting = false;
+        g9001_mp3_trim_padding(mp3->clip);
+        if (mp3->clip->len) {
+            g9001_mp3_play(s);
+        } else {
+            mp3->status = -1; /* MP3DEC_ERR_CANT_FIND_SYNC */
+        }
+    }
+}
+
+static uint32_t g9001_mp3_read(G9001Mp3 *mp3, unsigned offset)
+{
+    switch (offset) {
+    case 0x08:
+        return mp3->collecting ? mp3->transfer : 0;
+    case 0x0c:
+        return mp3->buffer;
+    case 0x10:
+        return mp3->size;
+    case 0x18:
+        return mp3->status == 0 ? mp3->event : 0;
+    default:
+        return mp3->status;
+    }
+}
+
+static void g9001_mp3_write(G9001State *s, unsigned offset, uint32_t value)
+{
+    G9001Mp3 *mp3 = &s->mp3;
+
+    switch (offset) {
+    case 0x04:
+        g_byte_array_set_size(mp3->clip, 0);
+        mp3->collecting = mp3->transfer != 0;
+        mp3->status = mp3->collecting ? 0 : -10; /* MP3DEC_ERR_NOT_OPEN */
+        break;
+    case 0x14:
+        g9001_mp3_submit(s, value);
+        break;
+    case 0x40:
+        g9001_mp3_open(s, value);
+        break;
+    case 0x44: /* Close */
+        mp3->transfer = 0;
+        mp3->event = 0;
+        /* fall through */
+    case 0x4c: /* Stop */
+        mp3->collecting = false;
+        mp3->status = 0;
+        break;
+    default: /* Pause and Resume are available during hardware streaming. */
+        mp3->status = -12; /* MP3DEC_ERR_INVALID_COMMAND */
+        break;
+    }
+}
+
 static uint64_t g9001_io_read(void *opaque, hwaddr offset, unsigned size)
 {
     G9001State *s = opaque;
     uint64_t value = 0;
     unsigned i;
 
+    if (size == 4 && offset >= G9001_MP3_IO && offset < G9001_MP3_IO + 0x60) {
+        return g9001_mp3_read(&s->mp3, offset - G9001_MP3_IO);
+    }
+
     for (i = 0; i < size; i++) {
         hwaddr off = offset + i;
+        int timer_index = g9001_t16_index(off);
         uint8_t v;
 
         if (off >= G9001_IO_SIZE) {
@@ -2466,12 +3159,17 @@ static uint64_t g9001_io_read(void *opaque, hwaddr offset, unsigned size)
             /* The init bit and the ready/busy status bits are self-clearing
              * on real silicon; the boot loader polls bits 4 and 3 here. */
             v = s->io[off] | G9001_SDRAMC_INI_READY;
-        } else if (off == G9001_IO_T16_0TC) {
-            g9001_t16_advance(s);
-            v = s->t16.counter & 0xff;
-        } else if (off == G9001_IO_T16_0TC + 1) {
-            g9001_t16_advance(s);
-            v = s->t16.counter >> 8;
+        } else if (off == G9001_IO_SDRAMC_REF + 3) {
+            /* SDRAM accesses are synchronous, so self-refresh starts at once. */
+            v = s->io[off] & ~G9001_SDRAMC_REF_SELDO;
+            if (s->io[G9001_IO_SDRAMC_REF + 2] & G9001_SDRAMC_REF_SELEN) {
+                v |= G9001_SDRAMC_REF_SELDO;
+            }
+        } else if (timer_index >= 0 &&
+                   (off & (G9001_T16_REGS - 2)) == G9001_T16_TC) {
+            g9001_t16_advance(s, timer_index);
+            g9001_update_irq(s);
+            v = extract32(s->t16[timer_index].counter, (off & 1) * 8, 8);
         } else {
             v = s->io[off];
         }
@@ -2479,6 +3177,9 @@ static uint64_t g9001_io_read(void *opaque, hwaddr offset, unsigned size)
         g9001_trace_push(s, off, 1, false, v);
     }
 
+    if (offset == G9001_IO_SPI_RXD && (size == 4 || size == 2)) {
+        s->spi.rxd_valid = false;
+    }
     if (s->trace_io) {
         info_report("g9001-io rd off=0x%04" HWADDR_PRIx " size=%u val=0x%"
                     PRIx64 " pc=0x%08x", offset, size, value,
@@ -2493,6 +3194,11 @@ static void g9001_io_write(void *opaque, hwaddr offset, uint64_t value,
     G9001State *s = opaque;
     unsigned i;
 
+    if (size == 4 && offset >= G9001_MP3_IO && offset < G9001_MP3_IO + 0x60) {
+        g9001_mp3_write(s, offset - G9001_MP3_IO, value);
+        return;
+    }
+
     if (s->trace_io) {
         info_report("g9001-io wr off=0x%04" HWADDR_PRIx " size=%u val=0x%"
                     PRIx64 " pc=0x%08x", offset, size, value,
@@ -2502,6 +3208,7 @@ static void g9001_io_write(void *opaque, hwaddr offset, uint64_t value,
     for (i = 0; i < size; i++) {
         hwaddr off = offset + i;
         uint8_t v = (value >> (8 * i)) & 0xff;
+        int timer_index = g9001_t16_index(off);
 
         if (off >= G9001_IO_SIZE) {
             continue;
@@ -2510,13 +3217,18 @@ static void g9001_io_write(void *opaque, hwaddr offset, uint64_t value,
 
         if (off >= G9001_IO_PORT_BASE &&
             off < G9001_IO_PORT_BASE + G9001_KEY_PORTS * 2) {
-            hwaddr rel = off - G9001_IO_PORT_BASE;
-
-            if (rel & 1) {
-                s->io[off] = v;         /* direction */
-            } else {
-                s->io[off] = v;         /* output latch */
+            s->io[off] = v;
+            g9001_key_irq_sample(s, true);
+            if ((off - G9001_IO_PORT_BASE) / 2 == G9001_SPI_CS_PORT) {
+                g9001_spi_set_cs(s,
+                    (g9001_port_dir(s, G9001_SPI_CS_PORT) & G9001_SPI_CS) &&
+                    !(g9001_port_data(s, G9001_SPI_CS_PORT) & G9001_SPI_CS));
             }
+            continue;
+        }
+
+        if (timer_index >= 0) {
+            g9001_t16_write(s, timer_index, off, v);
             continue;
         }
 
@@ -2543,46 +3255,50 @@ static void g9001_io_write(void *opaque, hwaddr offset, uint64_t value,
             }
             break;
         case G9001_IO_INT_FK01_FP03:
+            if (s->io[G9001_IO_INT_RSTONLY] & BIT(0)) {
+                s->io[off] &= ~v;
+            } else {
+                s->io[off] = v & 0x3f;
+            }
+            g9001_update_irq(s);
+            break;
         case G9001_IO_INT_F16T01:
+        case G9001_IO_INT_F16T45:
         case G9001_IO_INT_FLCDC:
-            g9001_t16_advance(s);
             s->io[off] &= ~v;
             g9001_update_irq(s);
             break;
+        case G9001_IO_INT_FDMA:
+            if (s->io[G9001_IO_INT_RSTONLY] & BIT(0)) {
+                s->io[off] &= ~v;
+            } else {
+                s->io[off] = v & 0x1f;
+            }
+            break;
         case G9001_IO_INT_E16T01:
+        case G9001_IO_INT_E16T45:
+        case G9001_IO_INT_EK01_EP03:
+        case G9001_IO_INT_PK01L:
+        case 0x0266:                  /* pINT_P16T01 */
+        case 0x0268:                  /* pINT_P16T45 */
             s->io[off] = v;
             g9001_update_irq(s);
             break;
-        case G9001_IO_T16_0CA:
-        case G9001_IO_T16_0CA + 1:
-        case G9001_IO_T16_0CB:
-        case G9001_IO_T16_0CB + 1:
-        case G9001_IO_T16_0CTL:
-        case G9001_IO_T16_0CTL + 1:
-            g9001_t16_advance(s);
-            s->io[off] = v;
-            s->t16.ca = s->io[G9001_IO_T16_0CA] |
-                        (s->io[G9001_IO_T16_0CA + 1] << 8);
-            s->t16.cb = s->io[G9001_IO_T16_0CB] |
-                        (s->io[G9001_IO_T16_0CB + 1] << 8);
-            s->t16.ctl = s->io[G9001_IO_T16_0CTL];
-            if ((s->t16.ctl & 0x01) != (s->t16.running ? 0x01 : 0)) {
-                s->t16.running = s->t16.ctl & 0x01;
-                s->t16.counter = 0;
-                s->t16.last_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-            }
-            break;
-        case G9001_IO_T16_0TC:
-        case G9001_IO_T16_0TC + 1:
-            s->io[off] = v;
-            s->t16.counter = s->io[G9001_IO_T16_0TC] |
-                             (s->io[G9001_IO_T16_0TC + 1] << 8);
+        case G9001_IO_KEYINTSEL:
+            s->io[off] = v & 0x77;
+            g9001_key_irq_sample(s, false);
             break;
         case G9001_IO_CMU_GATEDCLK0:
         case G9001_IO_CMU_GATEDCLK1:
-        case G9001_IO_CMU_CLKCNTL:
         case G9001_IO_CMU_OPT:
             s->io[off] = v;
+            break;
+        case G9001_IO_CMU_CLKCNTL:
+        case G9001_IO_CMU_CLKCNTL + 1:
+        case G9001_IO_T16_5CLKCTL:
+            g9001_t16_advance(s, G9001_T16_5_INDEX);
+            s->io[off] = v;
+            g9001_update_irq(s);
             break;
         case G9001_IO_SDRAMC_INI:
             s->io[off] = v;
@@ -2592,8 +3308,9 @@ static void g9001_io_write(void *opaque, hwaddr offset, uint64_t value,
         case G9001_IO_SPI_TXD + 2:
         case G9001_IO_SPI_TXD + 3:
             s->io[off] = v;
-            s->spi.txd = ldl_le_p(&s->io[G9001_IO_SPI_TXD]);
-            g9001_spi_txd_write(s, s->spi.txd);
+            if (offset == G9001_IO_SPI_TXD && size == 4 && i == 3) {
+                g9001_spi_txd_write(s, ldl_le_p(&s->io[G9001_IO_SPI_TXD]));
+            }
             break;
         case G9001_IO_SPI_CTL1:
         case G9001_IO_SPI_CTL1 + 1:
@@ -2606,18 +3323,35 @@ static void g9001_io_write(void *opaque, hwaddr offset, uint64_t value,
         case G9001_IO_SPI_RXD + 1:
         case G9001_IO_SPI_RXD + 2:
         case G9001_IO_SPI_RXD + 3:
-            /* clear the receive flag on read */
-            s->spi.rxd_valid = false;
             break;
-        case G9001_IO_HS2_STAT:
-            s->io[off] = v;
-            /*
-             * The firmware starts a transfer by setting bit 6.  Writing the
-             * register again with the bit still set must not start a second
-             * transfer, so trigger on the rising edge only.
-             */
-            if (v & 0x40) {
-                g9001_hsdma_run(s);
+        case G9001_IO_HS2_EN:
+            s->io[off] = v & BIT(0);
+            if (s->io[off] && (s->io[G9001_IO_HS2_TF] & BIT(0))) {
+                g9001_hsdma_run_ch2(s);
+            }
+            break;
+        case G9001_IO_HS3_EN:
+            s->io[off] = v & BIT(0);
+            if (s->io[off] && (s->io[G9001_IO_HS3_TF] & BIT(0))) {
+                g9001_hsdma_run_ch3(s);
+            }
+            break;
+        case G9001_IO_HS2_TF:
+        case G9001_IO_HS3_TF:
+            s->io[off] &= ~(v & BIT(0));
+            break;
+        case G9001_IO_INT_HSD_SWTRIG:
+            if ((v & G9001_HS2_BIT) && !(s->io[G9001_IO_INT_HSD23_TRIG] & 0xf)) {
+                s->io[G9001_IO_HS2_TF] |= BIT(0);
+                if (s->io[G9001_IO_HS2_EN] & BIT(0)) {
+                    g9001_hsdma_run_ch2(s);
+                }
+            }
+            if ((v & G9001_HS3_BIT) && !(s->io[G9001_IO_INT_HSD23_TRIG] >> 4)) {
+                s->io[G9001_IO_HS3_TF] |= BIT(0);
+                if (s->io[G9001_IO_HS3_EN] & BIT(0)) {
+                    g9001_hsdma_run_ch3(s);
+                }
             }
             break;
         case G9001_IO_ECC_ENA:
@@ -2666,24 +3400,106 @@ static const MemoryRegionOps g9001_io_ops = {
 /* keyboard input                                                            */
 /* ------------------------------------------------------------------------- */
 
-/*
- * PC key -> matrix (column, row).  The G9001 layout is not fully known yet, so
- * this is a "first working set" that can be rewritten once key.dll's table is
- * recovered; it keeps the emulator usable for navigation meanwhile.
- */
-static const struct {
-    int qcode;
-    uint8_t col;
-    uint8_t row;
-} g9001_keymap[] = {
-    { Q_KEY_CODE_UP,        0, 0 },
-    { Q_KEY_CODE_DOWN,      0, 1 },
-    { Q_KEY_CODE_LEFT,      0, 2 },
-    { Q_KEY_CODE_RIGHT,     0, 3 },
-    { Q_KEY_CODE_RET,       1, 0 },
-    { Q_KEY_CODE_ESC,       1, 1 },
-    { Q_KEY_CODE_SPC,       1, 2 },
-    { Q_KEY_CODE_BACKSPACE, 1, 3 },
+#define G9001_KEY(row, col) (1 + (row) * G9001_KEY_COLS + (col))
+
+/* Matrix positions from the SR-G9001 panel and the original key table. */
+static const uint8_t g9001_keymap[Q_KEY_CODE__MAX] = {
+    /* Dictionary modes, favorites, menu and card. */
+    [Q_KEY_CODE_F1] = G9001_KEY(0, 1),
+    [Q_KEY_CODE_F2] = G9001_KEY(1, 1),
+    [Q_KEY_CODE_F3] = G9001_KEY(2, 1),
+    [Q_KEY_CODE_F4] = G9001_KEY(3, 1),
+    [Q_KEY_CODE_F5] = G9001_KEY(4, 1),
+    [Q_KEY_CODE_F6] = G9001_KEY(5, 1),
+    [Q_KEY_CODE_F7] = G9001_KEY(6, 1),
+    [Q_KEY_CODE_F8] = G9001_KEY(1, 0),
+    [Q_KEY_CODE_F9] = G9001_KEY(2, 0),
+    [Q_KEY_CODE_F10] = G9001_KEY(7, 1),        /* menu */
+    [Q_KEY_CODE_MENU] = G9001_KEY(7, 1),
+    [Q_KEY_CODE_F11] = G9001_KEY(6, 0),        /* card */
+
+    /* Second row of panel function keys. */
+    [Q_KEY_CODE_F12] = G9001_KEY(5, 0),        /* power */
+    [Q_KEY_CODE_TAB] = G9001_KEY(3, 0),        /* multi-dictionary search */
+    [Q_KEY_CODE_INSERT] = G9001_KEY(4, 0),     /* example/phrase search */
+    [Q_KEY_CODE_BRACKET_LEFT] = G9001_KEY(5, 3),  /* translation display */
+    [Q_KEY_CODE_BRACKET_RIGHT] = G9001_KEY(6, 3), /* twin search */
+    [Q_KEY_CODE_BACKSLASH] = G9001_KEY(7, 3),  /* display style */
+    [Q_KEY_CODE_EQUAL] = G9001_KEY(1, 7),      /* font size */
+    [Q_KEY_CODE_HOME] = G9001_KEY(0, 0),       /* history */
+    [Q_KEY_CODE_PGUP] = G9001_KEY(2, 7),       /* previous headword */
+    [Q_KEY_CODE_PGDN] = G9001_KEY(3, 7),       /* next headword */
+    [Q_KEY_CODE_DELETE] = G9001_KEY(6, 6),     /* register/delete */
+    [Q_KEY_CODE_BACKSPACE] = G9001_KEY(6, 6),
+
+    [Q_KEY_CODE_Q] = G9001_KEY(0, 2),
+    [Q_KEY_CODE_W] = G9001_KEY(1, 2),
+    [Q_KEY_CODE_E] = G9001_KEY(2, 2),
+    [Q_KEY_CODE_R] = G9001_KEY(3, 2),
+    [Q_KEY_CODE_T] = G9001_KEY(4, 2),
+    [Q_KEY_CODE_Y] = G9001_KEY(5, 2),
+    [Q_KEY_CODE_U] = G9001_KEY(6, 2),
+    [Q_KEY_CODE_I] = G9001_KEY(7, 2),
+    [Q_KEY_CODE_O] = G9001_KEY(0, 3),
+    [Q_KEY_CODE_P] = G9001_KEY(1, 3),
+    [Q_KEY_CODE_A] = G9001_KEY(0, 4),
+    [Q_KEY_CODE_S] = G9001_KEY(1, 4),
+    [Q_KEY_CODE_D] = G9001_KEY(2, 4),
+    [Q_KEY_CODE_F] = G9001_KEY(3, 4),
+    [Q_KEY_CODE_G] = G9001_KEY(4, 4),
+    [Q_KEY_CODE_H] = G9001_KEY(5, 4),
+    [Q_KEY_CODE_J] = G9001_KEY(6, 4),
+    [Q_KEY_CODE_K] = G9001_KEY(7, 4),
+    [Q_KEY_CODE_L] = G9001_KEY(2, 3),
+    [Q_KEY_CODE_MINUS] = G9001_KEY(3, 3),
+    [Q_KEY_CODE_SEMICOLON] = G9001_KEY(0, 6),  /* spelling */
+    [Q_KEY_CODE_Z] = G9001_KEY(0, 5),
+    [Q_KEY_CODE_X] = G9001_KEY(1, 5),
+    [Q_KEY_CODE_C] = G9001_KEY(2, 5),
+    [Q_KEY_CODE_V] = G9001_KEY(3, 5),
+    [Q_KEY_CODE_B] = G9001_KEY(4, 5),
+    [Q_KEY_CODE_N] = G9001_KEY(5, 5),
+    [Q_KEY_CODE_M] = G9001_KEY(6, 5),
+    [Q_KEY_CODE_SLASH] = G9001_KEY(4, 3),      /* check / ? * & */
+
+    [Q_KEY_CODE_APOSTROPHE] = G9001_KEY(1, 6), /* phrases */
+    [Q_KEY_CODE_COMMA] = G9001_KEY(2, 6),      /* examples/explanation */
+    [Q_KEY_CODE_DOT] = G9001_KEY(3, 6),        /* jump */
+    [Q_KEY_CODE_ESC] = G9001_KEY(4, 6),
+    [Q_KEY_CODE_RET] = G9001_KEY(5, 6),        /* confirm/translate/audio */
+    [Q_KEY_CODE_LEFT] = G9001_KEY(4, 7),
+    [Q_KEY_CODE_RIGHT] = G9001_KEY(5, 7),
+    [Q_KEY_CODE_UP] = G9001_KEY(6, 7),
+    [Q_KEY_CODE_DOWN] = G9001_KEY(7, 7),
+
+    /* Alternate legends are interpreted by the firmware, e.g. in calculator. */
+    [Q_KEY_CODE_1] = G9001_KEY(0, 2),
+    [Q_KEY_CODE_2] = G9001_KEY(1, 2),
+    [Q_KEY_CODE_3] = G9001_KEY(2, 2),
+    [Q_KEY_CODE_4] = G9001_KEY(3, 2),
+    [Q_KEY_CODE_5] = G9001_KEY(4, 2),
+    [Q_KEY_CODE_6] = G9001_KEY(5, 2),
+    [Q_KEY_CODE_7] = G9001_KEY(6, 2),
+    [Q_KEY_CODE_8] = G9001_KEY(7, 2),
+    [Q_KEY_CODE_9] = G9001_KEY(0, 3),
+    [Q_KEY_CODE_0] = G9001_KEY(1, 3),
+    [Q_KEY_CODE_KP_1] = G9001_KEY(0, 2),
+    [Q_KEY_CODE_KP_2] = G9001_KEY(1, 2),
+    [Q_KEY_CODE_KP_3] = G9001_KEY(2, 2),
+    [Q_KEY_CODE_KP_4] = G9001_KEY(3, 2),
+    [Q_KEY_CODE_KP_5] = G9001_KEY(4, 2),
+    [Q_KEY_CODE_KP_6] = G9001_KEY(5, 2),
+    [Q_KEY_CODE_KP_7] = G9001_KEY(6, 2),
+    [Q_KEY_CODE_KP_8] = G9001_KEY(7, 2),
+    [Q_KEY_CODE_KP_9] = G9001_KEY(0, 3),
+    [Q_KEY_CODE_KP_0] = G9001_KEY(1, 3),
+    [Q_KEY_CODE_KP_DECIMAL] = G9001_KEY(0, 4), /* A */
+    [Q_KEY_CODE_KP_DIVIDE] = G9001_KEY(3, 5),  /* V */
+    [Q_KEY_CODE_KP_MULTIPLY] = G9001_KEY(4, 5),/* B */
+    [Q_KEY_CODE_KP_SUBTRACT] = G9001_KEY(5, 5),/* N */
+    [Q_KEY_CODE_KP_ADD] = G9001_KEY(6, 5),     /* M */
+    [Q_KEY_CODE_KP_EQUALS] = G9001_KEY(5, 6),
+    [Q_KEY_CODE_KP_ENTER] = G9001_KEY(5, 6),
 };
 
 static void g9001_keyboard_event(DeviceState *dev, QemuConsole *src,
@@ -2692,8 +3508,7 @@ static void g9001_keyboard_event(DeviceState *dev, QemuConsole *src,
     G9001State *s = g9001_active;
     InputKeyEvent *key;
     int qcode;
-    bool down;
-    unsigned i;
+    unsigned cell, row, col;
 
     (void)dev;
     (void)src;
@@ -2704,17 +3519,30 @@ static void g9001_keyboard_event(DeviceState *dev, QemuConsole *src,
 
     key = evt->u.key.data;
     qcode = qemu_input_key_value_to_qcode(key->key);
-    if (qcode < 0 || qcode >= Q_KEY_CODE__MAX) {
+    if (qcode <= Q_KEY_CODE_UNMAPPED || qcode >= Q_KEY_CODE__MAX) {
         return;
     }
-    down = key->down;
-    for (i = 0; i < ARRAY_SIZE(g9001_keymap); i++) {
-        if (g9001_keymap[i].qcode == qcode) {
-            s->key_state[g9001_keymap[i].col][g9001_keymap[i].row] =
-                down ? 1 : 0;
-            break;
+    cell = g9001_keymap[qcode];
+    if (!cell || s->host_key_down[qcode] == key->down) {
+        return;
+    }
+    s->host_key_down[qcode] = key->down;
+    row = (cell - 1) / G9001_KEY_COLS;
+    col = (cell - 1) % G9001_KEY_COLS;
+
+    if (!key->down) {
+        if (s->debug_key_col == col && s->debug_key_row == row) {
+            return;
+        }
+        for (unsigned other = 0; other < ARRAY_SIZE(g9001_keymap); other++) {
+            if (g9001_keymap[other] == cell && s->host_key_down[other]) {
+                return;
+            }
         }
     }
+    s->key_rows_by_column[col] =
+        deposit32(s->key_rows_by_column[col], row, 1, key->down);
+    g9001_key_irq_sample(s, true);
 }
 
 static const QemuInputHandler g9001_keyboard_handler = {
@@ -2733,6 +3561,7 @@ static void g9001_boot_from_nand(G9001State *s)
     G9001MachineState *gms;
     uint8_t *rom;
     unsigned config;
+    uint16_t checksum = 0;
 
     if (s->machine == NULL) {
         return;
@@ -2762,6 +3591,17 @@ static void g9001_boot_from_nand(G9001State *s)
      * data itself is not copied to A0RAM.
      */
     memcpy(s->a0ram_ptr, rom + 4, G9001_NAND_SMALL_PAGE - 4);
+
+    /*
+     * The G9001 power-on handler checks the retained A0RAM boot sector
+     * before reusing it. Its last halfword holds the sum of the preceding
+     * halfwords, including the padding after the 508-byte NAND payload.
+     */
+    stw_le_p(s->a0ram_ptr + G9001_NAND_SMALL_PAGE - 4, 0);
+    for (unsigned i = 0; i < G9001_NAND_SMALL_PAGE - 2; i += 2) {
+        checksum += lduw_le_p(s->a0ram_ptr + i);
+    }
+    stw_le_p(s->a0ram_ptr + G9001_NAND_SMALL_PAGE - 2, checksum);
 
     /*
      * The boot ROM leaves a small parameter block at the top of A0RAM; the
@@ -2795,7 +3635,7 @@ static void g9001_boot_from_nand(G9001State *s)
      * only ever toggles the port latches with xbset/xbclr instead of touching
      * the direction registers itself:
      *   P0.2 = CLE, P0.3 = ALE      -> outputs
-     *   P5.6 = #CE10                -> output
+     *   P5.6 = #CE11                -> output
      *   P3.0/P3.1 = #RE/#WE         -> outputs (bus side, latched 0)
      *   P4.0 = RY/#BY               -> input
      */
@@ -2804,8 +3644,8 @@ static void g9001_boot_from_nand(G9001State *s)
     s->io[G9001_IO_PORT_BASE + 3 * 2] = 0x00;       /* P3D  */
     s->io[G9001_IO_PORT_BASE + 3 * 2 + 1] = 0x03;   /* P3 dir: #RE/#WE */
     s->io[G9001_IO_PORT_BASE + 4 * 2 + 1] = 0x00;   /* P4 dir: RY/#BY in */
-    s->io[G9001_IO_PORT_BASE + 5 * 2] = 0xc0;       /* P5D: #CE10 idle high */
-    s->io[G9001_IO_PORT_BASE + 5 * 2 + 1] = 0x40;   /* P5 dir: #CE10 out */
+    s->io[G9001_IO_PORT_BASE + 5 * 2] = 0xc0;       /* P5D: #CE11 idle high */
+    s->io[G9001_IO_PORT_BASE + 5 * 2 + 1] = 0x40;   /* P5 dir: #CE11 out */
 
     cpu_set_pc(CPU(s->cpu), 0);
     info_report("g9001: boot ROM hand-off to 0x%08x (r10=0x%08x r11=0x%08x "
@@ -2843,15 +3683,14 @@ static void g9001_lcd_paint_test(G9001State *s)
             } else {
                 level = (x - 480) * 15 / 159;   /* horizontal ramp */
             }
-            row[x / 2] |= (x & 1) ? level : (level << 4);
+            row[x / 2] |= (x & 1) ? (level << 4) : level;
         }
     }
     stl_le_p(&s->io[G9001_IO_LCDC_HD], 0x0021001a);
     stl_le_p(&s->io[G9001_IO_LCDC_VD], 0x020a01df);
     stl_le_p(&s->io[G9001_IO_LCDC_MADD], G9001_SDRAM_BASE);
-    stl_le_p(&s->io[G9001_IO_LCDC_MLADD], G9001_LCD_STRIDE);
-    /* TFT select + LUT bypass (so the 4bpp levels map straight to grey) + 4bpp */
-    stl_le_p(&s->io[G9001_IO_LCDC_DMD], 0x80000012);
+    stl_le_p(&s->io[G9001_IO_LCDC_MLADD], G9001_LCD_STRIDE / 4);
+    stl_le_p(&s->io[G9001_IO_LCDC_DMD], 0x80000014);
     s->io[G9001_IO_LCDC_PS] = G9001_LCDC_PSAVE_MASK;
     info_report("g9001-lcd: painted 640x480 4bpp test pattern at 0x%08x "
                 "(stride %u)", G9001_SDRAM_BASE, G9001_LCD_STRIDE);
@@ -2865,6 +3704,7 @@ static void g9001_init(MachineState *machine)
     S1C33CPU *cpu;
 
     s->machine = machine;
+    s->io[G9001_IO_INT_RSTONLY] = 1;
     s->nand.cached_page = -1;
     s->trace_io = gms->trace_io;
     s->poke_fast = gms->debug_poke_fast;
@@ -2873,38 +3713,14 @@ static void g9001_init(MachineState *machine)
     s->trace_nand_latch_log = gms->trace_nand_latch_log;
     s->trace_nand_kernel = gms->trace_nand_kernel;
     s->trace_nand_kernel_pc_min = gms->trace_nand_kernel_pc_min;
-    g9001_mmc_default_identity(&s->mmc);
-    s->mmc.capacity_mb = gms->mmc_capacity_mb ? gms->mmc_capacity_mb : 128;
-    if (gms->mmc_cid_hex != NULL) {
-        unsigned char b[16];
-        if (sscanf(gms->mmc_cid_hex,
-                   "%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx"
-                   "%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx",
-                   &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6], &b[7],
-                   &b[8], &b[9], &b[10], &b[11], &b[12], &b[13], &b[14],
-                   &b[15]) == 16) {
-            memcpy(s->mmc.cid, b, 16);
+    s->mmc.fd = -1;
+    if (gms->spi_image_path && gms->spi_image_path[0]) {
+        if (g_strcmp0(gms->spi_card_type, "sd") == 0) {
+            g9001_sd_open(s, gms->spi_image_path);
         } else {
-            warn_report("bad mmc-cid-hex, keeping default CID");
+            g9001_mmc_open(&s->mmc, gms);
         }
     }
-    if (gms->mmc_csd_hex != NULL) {
-        unsigned char b[16];
-        if (sscanf(gms->mmc_csd_hex,
-                   "%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx"
-                   "%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx%2hhx",
-                   &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &b[6], &b[7],
-                   &b[8], &b[9], &b[10], &b[11], &b[12], &b[13], &b[14],
-                   &b[15]) == 16) {
-            memcpy(s->mmc.csd, b, 16);
-        } else {
-            warn_report("bad mmc-csd-hex, keeping default CSD");
-        }
-    } else {
-        g9001_mmc_update_csd(&s->mmc);
-    }
-    s->spi.ctl1 = 7u << G9001_SPI_CTL1_BPT_SHIFT;   /* 8-bit transfers */
-    g9001_mmc_open(s, gms->spi_image_path);
     if (gms->debug_exit_on_stall_ms != 0) {
         s->stall_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, g9001_stall_check,
                                       s);
@@ -2957,7 +3773,7 @@ static void g9001_init(MachineState *machine)
     s->debug_key_row = gms->debug_key_row;
     if (gms->debug_key_col < G9001_KEY_COLS &&
         gms->debug_key_row < G9001_KEY_ROWS) {
-        s->key_state[gms->debug_key_col][gms->debug_key_row] = 1;
+        s->key_rows_by_column[gms->debug_key_col] = BIT(gms->debug_key_row);
         info_report("g9001: holding key at column %u row %u",
                     gms->debug_key_col, gms->debug_key_row);
     }
@@ -2989,7 +3805,7 @@ static void g9001_init(MachineState *machine)
                 p++;
             }
         }
-        info_report("g9001: NAND bad blocks skipped by the dump: %u", 
+        info_report("g9001: NAND bad blocks skipped by the dump: %u",
                     s->nand.bad_count);
     }
 
@@ -3001,6 +3817,7 @@ static void g9001_init(MachineState *machine)
     memory_region_init_ram(&s->area1, NULL, "g9001.area1",
                            G9001_AREA1_SIZE, &error_fatal);
     memory_region_add_subregion(sysmem, G9001_AREA1_BASE, &s->area1);
+    g9001_mp3_install(s);
 
     memory_region_init_ram(&s->ivram, NULL, "g9001.ivram",
                            G9001_IVRAM_SIZE, &error_fatal);
@@ -3029,6 +3846,45 @@ static void g9001_init(MachineState *machine)
 
     memory_region_add_subregion(sysmem, G9001_SDRAM_BASE, machine->ram);
     s->sdram_ptr = memory_region_get_ram_ptr(machine->ram);
+
+    if (gms->debug_load_spec != NULL && gms->debug_load_spec[0] != '\0') {
+        char *spec = g_strdup(gms->debug_load_spec);
+        char *colon = strchr(spec, ':');
+        uint32_t when = 0;
+
+        if (colon == NULL) {
+            error_report("g9001: bad debug-load-file '%s' (want dst:path[:ms])",
+                         gms->debug_load_spec);
+        } else {
+            char *path = colon + 1;
+            char *last = strrchr(path, ':');
+
+            /*
+             * Optional trailing ":<ms>" so a modified image can be dropped in at a
+             * chosen virtual time instead of at reset (avoids the firmware's own
+             * clear/table writes racing the injection).
+             */
+            if (last != NULL && last[1] != '\0' &&
+                strspn(last + 1, "0123456789") == strlen(last + 1)) {
+                when = (uint32_t)strtoul(last + 1, NULL, 10);
+                *last = '\0';
+            }
+            *colon = '\0';
+            if (when == 0) {
+                g9001_load_host_file(s, (uint32_t)strtoul(spec, NULL, 0), path);
+            } else {
+                s->loadfile_addr = (uint32_t)strtoul(spec, NULL, 0);
+                s->loadfile_path = g_strdup(path);
+                s->loadfile_timer =
+                    timer_new_ms(QEMU_CLOCK_VIRTUAL, g9001_loadfile_cb, s);
+                timer_mod(s->loadfile_timer,
+                          qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + when);
+                info_report("g9001: will load '%s' at 0x%x after %u ms",
+                            path, s->loadfile_addr, when);
+            }
+        }
+        g_free(spec);
+    }
 
     /*
      * The SDRAMC chip select (#CE7) is decoded into Area 7 (0x400000, 2 MiB)
@@ -3076,7 +3932,6 @@ static void g9001_init(MachineState *machine)
                                                  &g9001_keyboard_handler);
     qemu_input_handler_activate(s->kbd_handler);
 
-    s->t16_hz = gms->t16_hz ?: 32768;
     s->t16_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, g9001_t16_cb, s);
     timer_mod(s->t16_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1);
 
@@ -3160,6 +4015,32 @@ static bool g9001_get_trace_irq(Object *obj, Error **errp)
 static void g9001_set_trace_irq(Object *obj, bool value, Error **errp)
 {
     G9001_MACHINE(obj)->trace_irq = value;
+}
+
+static char *g9001_get_audio_player(Object *obj, Error **errp)
+{
+    return g_strdup(G9001_MACHINE(obj)->audio_player);
+}
+
+static void g9001_set_audio_player(Object *obj, const char *value, Error **errp)
+{
+    G9001MachineState *gms = G9001_MACHINE(obj);
+
+    g_free(gms->audio_player);
+    gms->audio_player = g_strdup(value);
+}
+
+static char *g9001_get_audio_output(Object *obj, Error **errp)
+{
+    return g_strdup(G9001_MACHINE(obj)->audio_output);
+}
+
+static void g9001_set_audio_output(Object *obj, const char *value, Error **errp)
+{
+    G9001MachineState *gms = G9001_MACHINE(obj);
+
+    g_free(gms->audio_output);
+    gms->audio_output = g_strdup(value);
 }
 
 static char *g9001_get_nand_image(Object *obj, Error **errp)
@@ -3248,6 +4129,58 @@ static void g9001_set_copy_spec(Object *obj, const char *value, Error **errp)
     gms->debug_copy_spec = g_strdup(value);
 }
 
+static char *g9001_get_copy_until(Object *obj, Error **errp)
+{
+    G9001MachineState *gms = G9001_MACHINE(obj);
+    char buf[64];
+
+    snprintf(buf, sizeof(buf), "0x%x:0x%x", gms->debug_copy_until_addr,
+             gms->debug_copy_until_val);
+    return g_strdup(buf);
+}
+
+static void g9001_set_copy_until(Object *obj, const char *value, Error **errp)
+{
+    G9001MachineState *gms = G9001_MACHINE(obj);
+    char *end = NULL;
+    unsigned long a;
+
+    if (value == NULL || value[0] == '\0') {
+        gms->debug_copy_until_set = false;
+        return;
+    }
+    a = strtoul(value, &end, 0);
+    if (end == value || *end != ':') {
+        error_report("g9001: bad debug-copy-until '%s' (want addr:value)", value);
+        gms->debug_copy_until_set = false;
+        return;
+    }
+    gms->debug_copy_until_addr = (uint32_t)a;
+    gms->debug_copy_until_val = (uint32_t)strtoul(end + 1, NULL, 0);
+    gms->debug_copy_until_set = true;
+}
+
+static bool g9001_get_copy_once(Object *obj, Error **errp){
+    return G9001_MACHINE(obj)->debug_copy_once;
+}
+
+static void g9001_set_copy_once(Object *obj, bool value, Error **errp)
+{
+    G9001_MACHINE(obj)->debug_copy_once = value;
+}
+
+static char *g9001_get_load_spec(Object *obj, Error **errp){
+    return g_strdup(G9001_MACHINE(obj)->debug_load_spec);
+}
+
+static void g9001_set_load_spec(Object *obj, const char *value, Error **errp)
+{
+    G9001MachineState *gms = G9001_MACHINE(obj);
+
+    g_free(gms->debug_load_spec);
+    gms->debug_load_spec = g_strdup(value);
+}
+
 static char *g9001_get_patches(Object *obj, Error **errp)
 {
     return g_strdup(G9001_MACHINE(obj)->debug_patches);
@@ -3285,6 +4218,33 @@ static void g9001_set_spi_image(Object *obj, const char *value, Error **errp)
 
     g_free(gms->spi_image_path);
     gms->spi_image_path = g_strdup(value);
+}
+
+static char *g9001_get_spi_card_type(Object *obj, Error **errp)
+{
+    return g_strdup(G9001_MACHINE(obj)->spi_card_type ?: "mmc");
+}
+
+static void g9001_set_spi_card_type(Object *obj, const char *value, Error **errp)
+{
+    G9001MachineState *gms = G9001_MACHINE(obj);
+
+    if (strcmp(value, "mmc") && strcmp(value, "sd") && strcmp(value, "dict")) {
+        error_setg(errp, "spi-card-type must be 'mmc', 'sd' or 'dict'");
+        return;
+    }
+    g_free(gms->spi_card_type);
+    gms->spi_card_type = g_strdup(value);
+}
+
+static bool g9001_get_trace_spi(Object *obj, Error **errp)
+{
+    return G9001_MACHINE(obj)->trace_spi;
+}
+
+static void g9001_set_trace_spi(Object *obj, bool value, Error **errp)
+{
+    G9001_MACHINE(obj)->trace_spi = value;
 }
 
 static char *g9001_get_mmc_cid(Object *obj, Error **errp)
@@ -3449,7 +4409,6 @@ static void g9001_machine_instance_init(Object *obj)
     gms->nand_ale_pin = 3;          /* P0.3 = ALE  */
     gms->nand_ryby_pin = 4 * 8 + 0; /* P4.0 = RY/#BY */
     gms->debug_gpio_low_port = 0xffffffff;
-    gms->mmc_capacity_mb = 128;
     gms->nand_ignore_ecc = true;
     gms->slp_as_nop = true;
     gms->debug_dump_addr = 0x10000000;
@@ -3459,16 +4418,25 @@ static void g9001_machine_instance_init(Object *obj)
     gms->debug_key_row = 0xffffffff;
     gms->nand_ecc_offset = G9001_NAND_RAW_PAGE - 8;
 
+    object_property_add_str(obj, "audio-player",
+                            g9001_get_audio_player, g9001_set_audio_player);
+    object_property_set_description(obj, "audio-player",
+                                    "Play dictionary MP3 via an ffplay-compatible executable");
+    object_property_add_str(obj, "audio-output",
+                            g9001_get_audio_output, g9001_set_audio_output);
+    object_property_set_description(obj, "audio-output",
+                                    "Write the last dictionary pronunciation to this MP3 file");
     object_property_add_str(obj, "nand-image",
                             g9001_get_nand_image, g9001_set_nand_image);
     object_property_set_description(obj, "nand-image",
-                                    "Raw NAND dump (4096+128 byte pages, "
+                                    "Raw NAND dump (2048+64 byte pages, "
                                     "64 pages/block) to boot from");
     object_property_add_uint32_ptr(obj, "nand-id", &gms->nand_id,
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_set_description(obj, "nand-id",
-                                    "Four NAND ID bytes, most significant "
-                                    "byte first (default 0xecda1095)");
+                                    "First four NAND ID bytes, most significant "
+                                    "byte first (default 0x20d35195, followed "
+                                    "by 0x58 for NAND08GW3B2C)");
     object_property_add_bool(obj, "nand-save", g9001_get_nand_save,
                              g9001_set_nand_save);
     object_property_set_description(obj, "nand-save",
@@ -3530,8 +4498,8 @@ static void g9001_machine_instance_init(Object *obj)
     object_property_add_uint32_ptr(obj, "t16-hz", &gms->t16_hz,
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_set_description(obj, "t16-hz",
-                                    "16-bit timer 0 input clock in Hz "
-                                    "(default 32768, the OSC1 rate)");
+                                    "Override the input clock in Hz for "
+                                    "16-bit timers 0, 4 and 5");
     object_property_add_uint32_ptr(obj, "debug-p1-low-mask",
                                    &gms->debug_p1_low_mask,
                                    OBJ_PROP_FLAG_READWRITE);
@@ -3598,6 +4566,29 @@ static void g9001_machine_instance_init(Object *obj)
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_set_description(obj, "debug-copy-ms",
                                     "When to run debug-copy (ms, realtime)");
+    object_property_add_bool(obj, "debug-copy-once", g9001_get_copy_once,
+                             g9001_set_copy_once);
+    object_property_set_description(obj, "debug-copy-once",
+                                    "Fire debug-copy once at debug-copy-ms "
+                                    "instead of repeating");
+    object_property_add_uint32_ptr(obj, "debug-copy-gate",
+                                   &gms->debug_copy_gate,
+                                   OBJ_PROP_FLAG_READWRITE);
+    object_property_set_description(obj, "debug-copy-gate",
+                                    "Wait until this guest word is nonzero "
+                                    "before doing the (one-shot) debug-copy");
+    object_property_add_str(obj, "debug-copy-until",
+                            g9001_get_copy_until, g9001_set_copy_until);
+    object_property_set_description(obj, "debug-copy-until",
+                                    "Keep copying while memory[addr]==value "
+                                    "('addr:value'); stop as soon as it changes, "
+                                    "so a copy never races the firmware's own "
+                                    "relocation");
+    object_property_add_str(obj, "debug-load-file",
+                            g9001_get_load_spec, g9001_set_load_spec);
+    object_property_set_description(obj, "debug-load-file",
+                                    "Load a host file into guest RAM at reset "
+                                    "'dst:path', e.g. 0x100D8C00:/tmp/x.dll");
     object_property_add_str(obj, "debug-patches",
                             g9001_get_patches, g9001_set_patches);
     object_property_set_description(obj, "debug-patches",
@@ -3626,6 +4617,11 @@ static void g9001_machine_instance_init(Object *obj)
                             g9001_get_spi_image, g9001_set_spi_image);
     object_property_set_description(obj, "spi-image",
                                     "Raw SD/MMC card image served in SPI mode");
+    object_property_add_str(obj, "spi-card-type",
+                            g9001_get_spi_card_type, g9001_set_spi_card_type);
+    object_property_set_description(obj, "spi-card-type",
+                                    "mmc (read-only, default), dict (EDICT MMC), "
+                                    "or sd (writable)");
     object_property_add_str(obj, "mmc-cid-hex",
                             g9001_get_mmc_cid, g9001_set_mmc_cid);
     object_property_set_description(obj, "mmc-cid-hex",
@@ -3638,12 +4634,15 @@ static void g9001_machine_instance_init(Object *obj)
                                    &gms->mmc_capacity_mb,
                                    OBJ_PROP_FLAG_READWRITE);
     object_property_set_description(obj, "mmc-capacity-mb",
-                                    "Capacity programmed into a default CSD");
+                                    "Override synthesized MMC capacity in MiB");
     object_property_add_bool(obj, "debug-spi-test",
                              g9001_get_spi_test, g9001_set_spi_test);
     object_property_set_description(obj, "debug-spi-test",
-                                    "Run a scripted CMD0/8/10/17 exchange "
+                                    "Run a scripted MMC exchange "
                                     "through the SPI model and log it");
+    object_property_add_bool(obj, "trace-spi",
+                             g9001_get_trace_spi, g9001_set_trace_spi);
+    object_property_set_description(obj, "trace-spi", "Log SPI MMC commands");
     object_property_add_uint32_ptr(obj, "debug-gpio-low-port",
                                    &gms->debug_gpio_low_port,
                                    OBJ_PROP_FLAG_READWRITE);
@@ -3769,11 +4768,22 @@ static void g9001_machine_instance_finalize(Object *obj)
 {
     G9001MachineState *gms = G9001_MACHINE(obj);
 
+    g_free(gms->audio_player);
+    g_free(gms->audio_output);
     g_free(gms->nand_image_path);
     g_free(gms->nand_bad_blocks);
     g_free(gms->debug_lcd_dump_path);
+    g_free(gms->debug_load_spec);
+    g_free(gms->spi_image_path);
+    g_free(gms->spi_card_type);
+    g_free(gms->mmc_cid_hex);
+    g_free(gms->mmc_csd_hex);
     if (g9001_active != NULL) {
         g9001_nand_close(g9001_active);
+        g_clear_pointer(&g9001_active->mp3.clip, g_byte_array_unref);
+        if (g9001_active->mmc.fd >= 0) {
+            close(g9001_active->mmc.fd);
+        }
         g9001_active = NULL;
     }
 }
@@ -3793,18 +4803,25 @@ static void g9001_machine_class_init(ObjectClass *oc, const void *data)
     mc->no_parallel = 1;
 }
 
-static const TypeInfo g9001_machine_type_info = {
-    .name = TYPE_G9001_MACHINE,
-    .parent = TYPE_MACHINE,
-    .instance_size = sizeof(G9001MachineState),
-    .instance_init = g9001_machine_instance_init,
-    .instance_finalize = g9001_machine_instance_finalize,
-    .class_init = g9001_machine_class_init,
-};
-
-static void g9001_machine_register_types(void)
+static void g9001_spi_host_class_init(ObjectClass *oc, const void *data)
 {
-    type_register_static(&g9001_machine_type_info);
+    DEVICE_CLASS(oc)->user_creatable = false;
 }
 
-type_init(g9001_machine_register_types)
+static const TypeInfo g9001_types[] = {
+    {
+        .name = TYPE_G9001_MACHINE,
+        .parent = TYPE_MACHINE,
+        .instance_size = sizeof(G9001MachineState),
+        .instance_init = g9001_machine_instance_init,
+        .instance_finalize = g9001_machine_instance_finalize,
+        .class_init = g9001_machine_class_init,
+    },
+    {
+        .name = TYPE_G9001_SPI_HOST,
+        .parent = TYPE_DEVICE,
+        .class_init = g9001_spi_host_class_init,
+    },
+};
+
+DEFINE_TYPES(g9001_types)

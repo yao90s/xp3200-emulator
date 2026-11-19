@@ -64,6 +64,12 @@ static inline uint32_t s1c33_addr_mask(uint32_t core_variant)
 #define S1C33_TRAP_NMI_VECTOR 7
 #define S1C33_CPU_INTERRUPT_NMI CPU_INTERRUPT_TGT_EXT_3
 
+/* TB flags encode an immediate extension carried across a TB boundary. */
+#define S1C33_TB_EXT_COUNT_BITS  2
+#define S1C33_TB_EXT_VALUE_BITS  13
+#define S1C33_TB_EXT0_SHIFT      S1C33_TB_EXT_COUNT_BITS
+#define S1C33_TB_EXT1_SHIFT      (S1C33_TB_EXT0_SHIFT + S1C33_TB_EXT_VALUE_BITS)
+
 typedef struct CPUArchState {
     uint32_t regs[S1C33_NUM_REGS];
     uint32_t pc;

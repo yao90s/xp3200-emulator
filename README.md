@@ -173,6 +173,8 @@ bash scripts/xp3200/sd_image.sh create ~/card.img 128 "SD CARD" ~/音乐 ~/电�
 | `bbk9288`、`bbk9288s` | S1C33L05 | 上游 bbk9288-emulator 的机型 |
 | `g9001` | S1C33E08 | **研究机型**：精工 SII G9001 日文词典，640×480 单色 TFT |
 
+XP3200 的 320×240 LCD 由 `hw/s1c33/xp3200.c` 渲染。G9001 在 `hw/s1c33/g9001.c` 按该机型的 640×480 4bpp 布局读取 SDRAM，每字节先显示低半字节对应的像素。两个机型分别验证自己的显示输出。
+
 `g9001` 与 XP3200 共用同一份 `target/s1c33` CPU 核，但两个核心的寻址宽度不同：
 L05 是 28 位内部地址总线、TTBR bit31:28 固定 0；E08 保持完整 32 位（SDRAM 在
 `0x10000000` 以上）。差异由 CPU 的 `core-variant` 属性选择（默认 `l05`），
@@ -190,6 +192,58 @@ NAND=g9001-nand.bin    bash scripts/g9001/smoke.sh      # 引导 + E08 OS 入口
 在 CI 里跑。`g9001` 的 `slp-as-nop` 是机型属性（默认开），可用
 `-M g9001,slp-as-nop=off` 关掉。
 
+## G9001 用法
+
+在 Linux 或 WSL2 中从仓库根目录执行。图形窗口需要 GTK 后端，WSL2 下使用 WSLg。将 `NAND` 换成从设备提取的原始 NAND 路径。下面的坏块表对应已验证的 `NAND08GW3B2C.bin`，其他提取方式需使用对应的坏块表。
+
+```bash
+QEMU=./_build/qemu-system-s1c33
+NAND=/path/to/NAND08GW3B2C.bin
+M="g9001,nand-image=$NAND,nand-bad-blocks=286:509:1303:1305:2319:3343:4806"
+"$QEMU" -M "$M,audio-player=ffplay" \
+    -cpu c33l05,exit-on-halt=off -display gtk -monitor none -serial none
+```
+
+等到 640×480 的「複数辞書一括検索」界面出现，再聚焦窗口操作。NAND 默认只读打开，固件改动保存在本次进程的内存覆盖层。用 `,audio-player=ffplay` 启用词典录音播放，或用 `,audio-output=pronunciation.mp3` 导出最近一次发音。
+
+| 操作 | PC 键 |
+|---|---|
+| 词典与收藏 | `F1` 広辞苑，`F2` 英和，`F3` 和英，`F4` ブリタニカ，`F5`–`F7` 商用词典，`F8`–`F9` 收藏 |
+| 菜单、卡、电源 | `F10` 或菜单键打开菜单，`F11` 进入扩充卡，`F12` 熄屏并在同一次 QEMU 运行中恢复原词条 |
+| 输入与查词 | `Tab` 一括搜索，`Insert` 例文・成句搜索，字母键输入，方向键选候选，`Enter` 打开，`Esc` 返回或清空 |
+| 翻页与历史 | `Page Up` / `Page Down` 切换前后见出し，左右键翻页，`Home` 打开履历 |
+| 显示 | `[` 译文显示切换，`]` 双搜索，反斜杠切换显示样式，`=` 切换字号 |
+| 词条动作 | `'` 成句・熟语，`,` 例文・解说，`.` 跳转，`;` 拼写，`/` 检查或通配符，`Delete` / `Backspace` 登记・删除 |
+| 数字与计算 | 数字行及小键盘 `1`–`0` 与 Q–P 共用实体键，连字符用 `-`。小键盘的点、除、乘、减、加及等号使用固件的实体键副标 |
+
+**原始词典扩充卡**使用 `dict` 模式，只读挂载 `dict.img`。**普通 SD** 使用 `sd` 模式和整卡 raw 镜像，固件写入会保存到该文件。已验证 128 MiB 标准容量 SD。
+
+```bash
+# 在启动命令的 -M 字符串末尾追加对应的卡参数
+# 词典扩充卡  ,spi-card-type=dict,spi-image=/path/to/dict.img
+# 普通 SD    ,spi-card-type=sd,spi-image=/path/to/sd128.img
+```
+
+内置英和词典打开 `apple` 的全文后，按一次 `Enter` 选中扬声器，再按一次播放。挂载扩充卡后按 `F11`，再按 `Enter` 进入中日词典。输入 `ni`，等候候选出现，用 `Enter` 打开「妮」，在全文再按一次 `Enter` 发音。
+
+无窗口抓屏时，在约 15 秒处导出一帧。可调大两处时间参数以等待较慢的启动。
+
+```bash
+timeout 25 "$QEMU" \
+    -M "$M,debug-lcd-dump-ms=15000,debug-lcd-dump-path=g9001.pgm" \
+    -cpu c33l05,exit-on-halt=off -display none -monitor none -serial none
+```
+
+冒烟测试使用本地镜像，矩阵测试无需镜像，发音回归需安装 FFmpeg。
+
+```bash
+NAND="$NAND" QEMU="$QEMU" bash scripts/g9001/smoke.sh
+python3 scripts/g9001/keyboard_matrix_smoke.py
+python3 scripts/g9001/keyboard_smoke.py --nand "$NAND" --power-cycle --pronunciation
+python3 scripts/g9001/keyboard_smoke.py --nand "$NAND" --card /path/to/dict.img \
+    --card-lookup --pronunciation --out _build/g9001-card-smoke
+```
+
 ## 代码结构
 
 - `hw/s1c33/`：S1C33 板级设备；`xp3200.c` 为 XP3200 machine（LCD、NAND、NOR、
@@ -197,7 +251,7 @@ NAND=g9001-nand.bin    bash scripts/g9001/smoke.sh      # 引导 + E08 OS 入口
 - `target/s1c33/`：Epson S1C33 CPU 翻译、指令 helper 和反汇编；`core-variant`
   在这里按型号选择寻址宽度。
 - `docs/xp3200/`：硬件连接、键盘映射、源码阅读指南、SD 卡工具说明、移植进度与技术笔记。
-- `scripts/xp3200/`：SD 卡镜像工具与冒烟测试；`scripts/g9001/`：G9001 冒烟测试。
+- `scripts/xp3200/`：SD 卡镜像工具与冒烟测试；`scripts/g9001/`：G9001 启动、显示、键盘和发音回归。
 
 ## 资料依据
 

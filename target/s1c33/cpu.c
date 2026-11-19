@@ -36,8 +36,16 @@ static vaddr s1c33_cpu_get_pc(CPUState *cs)
 static TCGTBCPUState s1c33_get_tb_cpu_state(CPUState *cs)
 {
     CPUS1C33State *env = cpu_env(cs);
+    uint32_t flags = env->ext_count;
 
-    return (TCGTBCPUState){ .pc = env->pc, .flags = 0 };
+    if (env->ext_count >= 1) {
+        flags |= env->ext[0] << S1C33_TB_EXT0_SHIFT;
+    }
+    if (env->ext_count == 2) {
+        flags |= env->ext[1] << S1C33_TB_EXT1_SHIFT;
+    }
+
+    return (TCGTBCPUState){ .pc = env->pc, .flags = flags };
 }
 
 static uint8_t s1c33_cpu_interrupt_level(CPUS1C33State *env)
@@ -72,11 +80,15 @@ static void s1c33_restore_state_to_opc(CPUState *cs,
 
 static bool s1c33_cpu_has_work(CPUState *cs)
 {
+    S1C33CPU *cpu = S1C33_CPU(cs);
     CPUS1C33State *env = cpu_env(cs);
 
+    /* On E08, an ITC request can release HALT while PSR masks the trap. */
     return cpu_test_interrupt(cs, S1C33_CPU_INTERRUPT_NMI) ||
            (cpu_test_interrupt(cs, CPU_INTERRUPT_HARD) &&
-            s1c33_cpu_irq_ready(env));
+            (s1c33_cpu_irq_ready(env) ||
+             (cpu->core_variant == S1C33_CORE_E08 && !env->in_sleep &&
+              env->irq_pending)));
 }
 
 static int s1c33_cpu_mmu_index(CPUState *cs, bool ifetch)
@@ -264,6 +276,11 @@ void s1c33_cpu_do_interrupt(CPUState *cs)
 
 bool s1c33_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
 {
+    /* The core accepts asynchronous traps after the extended instruction. */
+    if (cpu_env(cs)->ext_count != 0) {
+        return false;
+    }
+
     if ((interrupt_request & S1C33_CPU_INTERRUPT_NMI) != 0) {
         cpu_reset_interrupt(cs, S1C33_CPU_INTERRUPT_NMI);
         s1c33_cpu_enter_trap(cs, "NMI", S1C33_TRAP_NMI_VECTOR, 0, false);

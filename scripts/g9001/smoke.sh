@@ -15,9 +15,9 @@
 #   1. the binary registers the g9001 machine
 #   2. the boot ROM reads its configuration data from NAND
 #   3. the firmware OS entry point (0x11e841b0) is executed
-#   4. the LCD renderer produces a 640x480 frame with 16 grey levels
+#   4. the LCD renderer preserves grey levels and the order of paired pixels
 #
-# The exhaustive 13-check regression lives in the G9001 workspace
+# The full regression lives in the G9001 workspace
 # (tools/emu/selftest.sh); this script is the cheap gate that must run
 # whenever the shared CPU core changes.
 set -u
@@ -82,11 +82,17 @@ head, _, body = data.partition(b"\n255\n")
 magic, dims = head.split(b"\n", 1)
 w, h = (int(x) for x in dims.split())
 levels = len(set(body))
-if (w, h) == (640, 480) and levels == 16:
-    print("PASS  LCD frame 640x480 4bpp with 16 grey levels")
-    sys.exit(0)
-print("FAIL  LCD frame %dx%d with %d grey levels" % (w, h, levels))
-sys.exit(1)
+if magic != b"P5" or (w, h, len(body), levels) != (640, 480, 640 * 480, 16):
+    print("FAIL  LCD frame %dx%d with %d grey levels" % (w, h, levels))
+    sys.exit(1)
+
+# The checkerboard changes across x=254/255 within a packed byte, and is
+# inverted across y=14/15. This also checks the programmed 81-word stride.
+if body[14 * w + 254:14 * w + 256] != bytes((0, 17)) or \
+        body[15 * w + 254:15 * w + 256] != bytes((17, 0)):
+    print("FAIL  LCD pixels are out of order")
+    sys.exit(1)
+print("PASS  LCD frame 640x480 with 16 grey levels and correct paired pixels")
 PY
 [ $? -eq 0 ] || FAIL=$((FAIL + 1))
 
